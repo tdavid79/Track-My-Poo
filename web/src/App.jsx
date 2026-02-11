@@ -17,7 +17,7 @@ const OSRM_ROUTE_URL = "https://router.project-osrm.org/route/v1/driving";
 const STREET_SPEED_MPS = 1.1;
 
 // Snap tolerance (metres) when determining pipe connectivity by endpoints
-const NODE_SNAP_TOL_M = 1.0; // max snap distance when linking pipes by endpoints
+const NODE_SNAP_TOL_M = 8;
 
 // Simulation safety clamps
 const PIPE_SPEED_MIN_MPS = 0.2;
@@ -513,9 +513,10 @@ function findNearestObjectIdBySewerNameFromByObjectId(byObjectId, pointLL, sewer
 
 
 function orderedCoordsForPipe(ft) {
-  // GeoJSON coordinate order is treated as upstream -> downstream.
-  // We intentionally ignore any derived "DIR" fields.
-  return flattenFeatureCoords(ft);
+  const p = ft?.properties || {};
+  const dir = String(p._dir || "u_to_d");
+  const coords = flattenFeatureCoords(ft);
+  return dir === "d_to_u" ? coords.slice().reverse() : coords;
 }
 
 function chooseNextPipeByBearing(nextIds, byObjectId, currOrderedCoords, prevId, visited) {
@@ -555,107 +556,84 @@ function chooseNextPipeByBearing(nextIds, byObjectId, currOrderedCoords, prevId,
   return bestId !== null ? bestId : (ids.slice().sort((a, b) => a - b)[0] ?? null);
 }
 
-function buildPipePlanFromObjectId(startObjectId, startPoint = null, maxHops = 5000) {
-  // Build a downstream-only plan using endpoint-matched adjacency (<= NODE_SNAP_TOL_M).
-  // Includes light backtracking so we only terminate at the designated outfalls.
-  const TERMINALS = new Set([311851, 311905]); // Werribee, Mornington
-
-  const pipeObjectIds = [];
+function buildPipePlanFromObjectId(startObjectId, startPoint, byObjectId, maxHops = 2000) {
+  // DIR-first traversal:
+  // - Each pipe has an explicit DIR (u_to_d / d_to_u). We treat this as authoritative.
+  // - Connectivity is: current pipe FLOW-END node -> next pipe FLOW-START node.
+  // - `_nextObjectIds` is built from endpoint snapping + flow-start matching (plus a small fallback).
   const plan = [];
+  const visited = new Set();
+  const visitedCells = new Set();
 
-  if (startObjectId === null || startObjectId === undefined) {
-    return { pipeObjectIds, plan };
-  }
-
-  // DFS stack frames: { id, prev, tried:Set<number> }
-  const stack = [{ id: startObjectId, prev: null, tried: new Set() }];
-  const onStack = new Set([startObjectId]);
-
-  let safety = 0;
-
-  while (stack.length > 0 && safety < maxHops) {
-    safety++;
-
-    const frame = stack[stack.length - 1];
-    const currentId = frame.id;
-    const ft = byObjectId.get(currentId);
-    if (!ft) {
-      // Unknown ID: backtrack
-      onStack.delete(currentId);
-      stack.pop();
-      continue;
-    }
-
-    // If we reached a terminal, stop successfully.
-    if (TERMINALS.has(currentId)) break;
-
-    const candidatesAll = (ft.properties._nextObjectIds || []).filter((id) => id !== null && id !== undefined);
-    const candidates = candidatesAll.filter((id) => !onStack.has(id) && !frame.tried.has(id));
-
-    if (candidates.length === 0) {
-      // Dead end: backtrack
-      onStack.delete(currentId);
-      stack.pop();
-      continue;
-    }
-
-    const nextId = chooseNextPipeByBearing(frame.prev, currentId, candidates, byObjectId);
-    frame.tried.add(nextId);
-
-    stack.push({ id: nextId, prev: currentId, tried: new Set() });
-    onStack.add(nextId);
-  }
-
-  // If we stopped without reaching a terminal (and didn't exhaust stack), we keep whatever we found.
-  for (const fr of stack) pipeObjectIds.push(fr.id);
-
-  // Build polyline points from the pipe sequence
+  let currentId = startObjectId;
+  let prevId = null;
   let first = true;
-  for (const objectId of pipeObjectIds) {
-    const ft = byObjectId.get(objectId);
-    if (!ft) continue;
+
+  while (currentId !== null && currentId !== undefined && !visited.has(currentId) && visited.size < maxHops) {
+    const ft = byObjectId.get(currentId);
+    if (!ft) break;
+
+    visited.add(currentId);
 
     const ord = orderedCoordsForPipe(ft);
-    if (!ord || ord.length < 2) continue;
+    if (ord.length < 2) break;
 
-    if (first) {
-      first = false;
+    if (first && startPoint) {
+      plan.push({ lng: startPoint.lng, lat: startPoint.lat });
 
-      if (startPoint) {
-        plan.push({ lng: startPoint.lng, lat: startPoint.lat });
-        // Continue from the nearest vertex onwards (avoid doubling back)
-        let bestIdx = 0;
-        let bestD = Infinity;
-        for (let i = 0; i < ord.length; i++) {
-          const [lng, lat] = ord[i];
-          const d = (lng - startPoint.lng) * (lng - startPoint.lng) + (lat - startPoint.lat) * (lat - startPoint.lat);
-          if (d < bestD) {
-            bestD = d;
-            bestIdx = i;
-          }
-        }
-        for (let i = bestIdx + 1; i < ord.length; i++) {
-          const [lng, lat] = ord[i];
-          plan.push({ lng, lat });
-        }
-      } else {
-        const [lng0, lat0] = ord[0];
-        plan.push({ lng: lng0, lat: lat0 });
-        for (let i = 1; i < ord.length; i++) {
-          const [lng, lat] = ord[i];
-          plan.push({ lng, lat });
+      let nearestIdx = 0;
+      let bestDist = Infinity;
+      for (let i = 0; i < ord.length; i++) {
+        const d = metersBetween(startPoint, ord[i]);
+        if (d < bestDist) {
+          bestDist = d;
+          nearestIdx = i;
         }
       }
+
+      for (let i = nearestIdx; i < ord.length; i++) {
+        const k = gridKey(ord[i], 5);
+        if (visitedCells.has(k)) continue;
+        visitedCells.add(k);
+        plan.push(ord[i]);
+      }
+
+      first = false;
     } else {
-      // Append, skipping the first coordinate to avoid duplicate joins
-      for (let i = 1; i < ord.length; i++) {
-        const [lng, lat] = ord[i];
-        plan.push({ lng, lat });
+      const last = plan[plan.length - 1];
+      for (let i = 0; i < ord.length; i++) {
+        const pt = ord[i];
+        if (last && metersBetween(last, pt) < 0.2) continue;
+        const k = gridKey(pt, 5);
+        if (visitedCells.has(k)) continue;
+        visitedCells.add(k);
+        plan.push(pt);
       }
     }
+
+    const p = ft.properties || {};
+    const nextIds = Array.isArray(p._nextObjectIds) ? p._nextObjectIds : [];
+    const nextId = chooseNextPipeByBearing(nextIds, byObjectId, ord, prevId, visited);
+
+    if (visited.size < 120) {
+      console.log(
+        "[PIPEHOP] " +
+          currentId +
+          " -> " +
+          nextId +
+          ' | name="' +
+          dbgName(p) +
+          '" | candidates=[' +
+          nextIds.join(", ") +
+          "]"
+      );
+    }
+
+    prevId = currentId;
+    currentId = nextId;
   }
 
-  return { pipeObjectIds, plan };
+  return plan;
 }
 
 
@@ -834,84 +812,6 @@ export default function App() {
 
         const nodeIndex = new Map();
         const byObjectId = new Map();
-
-        
-        // Build upstream endpoint index (1m snap) to link pipes strictly by shared endpoints.
-        // We treat the GeoJSON coordinate order as upstream -> downstream and ignore any derived DIR/IL logic.
-        const upstreamIndex = new Map(); // key -> [{ objectId, upXY:{x,y}, upLL:{lat,lng} }]
-        const neighborKeys = (key) => {
-          const parts = String(key).split(",");
-          if (parts.length !== 2) return [key];
-          const kx = parseInt(parts[0], 10);
-          const ky = parseInt(parts[1], 10);
-          const out = [];
-          for (let dx = -1; dx <= 1; dx++) {
-            for (let dy = -1; dy <= 1; dy++) {
-              out.push(`${kx + dx},${ky + dy}`);
-            }
-          }
-          return out;
-        };
-
-        // First pass: compute endpoints + populate upstreamIndex
-        for (const f of features) {
-          const coords = flattenFeatureCoords(f);
-          if (!coords || coords.length < 2) continue;
-
-          const [upLng, upLat] = coords[0];
-          const [downLng, downLat] = coords[coords.length - 1];
-
-          const upXY = projectLngLatToWebMercatorMeters(upLng, upLat);
-          const downXY = projectLngLatToWebMercatorMeters(downLng, downLat);
-
-          f.properties._upLL = { lat: upLat, lng: upLng };
-          f.properties._downLL = { lat: downLat, lng: downLng };
-          f.properties._upXY = upXY;
-          f.properties._downXY = downXY;
-
-          const upKey = nodeKeyFromLngLat(upLng, upLat, NODE_SNAP_TOL_M);
-          const downKey = nodeKeyFromLngLat(downLng, downLat, NODE_SNAP_TOL_M);
-          f.properties._upNodeKey = upKey;
-          f.properties._downNodeKey = downKey;
-
-          // Keep for popup/debug only
-          f.properties._nodeKeys = `${upKey} -> ${downKey}`;
-
-          const objectId = f.properties.OBJECTID;
-          const arr = upstreamIndex.get(upKey) || [];
-          arr.push({ objectId, upXY, upLL: f.properties._upLL });
-          upstreamIndex.set(upKey, arr);
-        }
-
-        // Second pass: assign strictly-local downstream connections (<= 1m)
-        for (const f of features) {
-          const objectId = f.properties.OBJECTID;
-          const downXY = f.properties._downXY;
-          const downKey = f.properties._downNodeKey;
-
-          const candidates = [];
-          if (downXY && downKey != null) {
-            for (const k of neighborKeys(downKey)) {
-              const arr = upstreamIndex.get(k);
-              if (!arr) continue;
-
-              for (const cand of arr) {
-                if (cand.objectId === objectId) continue;
-
-                const dx = cand.upXY.x - downXY.x;
-                const dy = cand.upXY.y - downXY.y;
-                const d = Math.sqrt(dx * dx + dy * dy);
-
-                if (d <= NODE_SNAP_TOL_M) candidates.push(cand.objectId);
-              }
-            }
-          }
-
-          // Deduplicate, keep stable order
-          f.properties._nextObjectIds = Array.from(new Set(candidates));
-        }
-
-const byObjectId = new Map();
 
         function ensureNode(key, lng, lat) {
           if (!nodeIndex.has(key)) {
