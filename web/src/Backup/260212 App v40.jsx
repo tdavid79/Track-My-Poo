@@ -1341,6 +1341,8 @@ export default function App() {
                     <div><b>Slope (GRADE):</b> ${p.GRADE ?? "—"}</div>
                     <div><b>Up IL / Down IL:</b> ${p.UPSTREAM_IL ?? "—"} / ${p.DOWNSTREAM_IL ?? "—"}</div>
                     <div><b>Velocity (half-full):</b> ${vTxt}</div>
+                    <div><b>Dir:</b> ${p._dir ?? "—"}</div>
+                    <div><b>Next OBJECTIDs:</b> ${next}</div>
                   </div>`
                 );
               }}
@@ -1412,6 +1414,8 @@ export default function App() {
                           <div><b>Slope (GRADE):</b> {sp.GRADE ?? "—"}</div>
                           <div><b>Up IL / Down IL:</b> {sp.UPSTREAM_IL ?? "—"} / {sp.DOWNSTREAM_IL ?? "—"}</div>
                           <div><b>Velocity (half-full):</b> {vTxt}</div>
+                          <div><b>Dir:</b> {sp._dir ?? "—"}</div>
+                          <div><b>Next OBJECTIDs:</b> {next}</div>
 						  <div><b>Virtual next:</b> ${p._virtual_next_mode ?? "—"} ${p._virtual_next_dist_m ? `(${Number(p._virtual_next_dist_m).toFixed(1)} m)` : ""} ${p._virtual_next_radius_m ? `r=${p._virtual_next_radius_m} m` : ""}</div>
 				          <div><b>Virtual next dist:</b> ${p._virtual_next_dist_m ?? "—"} m</div>
 
