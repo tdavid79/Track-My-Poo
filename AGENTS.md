@@ -1,101 +1,82 @@
 # AGENTS.md
 
 ## Project Overview
-`APP_Track_my_poo` is a single-page React + Leaflet simulation app.
-It visualizes sewer pipes from GeoJSON and animates "flush points" from user/device location:
-1. Street travel to nearest pipe via OSRM.
-2. Pipe-network traversal using directed connectivity and Manning-based speeds.
+`APP_Track_my_poo` is a two-part app:
+1. `web/` (React + Vite + Leaflet) for map simulation UI.
+2. `server/` (Express + SQLite) for persistence, replay state, and SSE push updates.
 
-Primary working directory: `web/`.
+The app simulates flush travel in two phases:
+1. Street route to sewer contact point (OSRM).
+2. Directed pipe-network traversal to true endpoints.
 
-## Stack And Runtime
-- Vite + React 19 (`web/package.json`)
-- React-Leaflet + Leaflet map rendering
-- GeoJSON loaded from `web/public/`
-- ESLint flat config (`web/eslint.config.js`)
-- External dependency at runtime: OSRM demo API (`https://router.project-osrm.org`)
+## Active Architecture
+- Frontend persists/rehydrates flush runs through backend APIs.
+- Backend stores runs in SQLite (`server/data/flushes.db`).
+- Cross-browser live sync uses SSE (`GET /api/events`).
+- Routing includes fallback logic designed to stay on the purple sewer network where possible.
 
-Scripts (run in `web/`):
-- `npm run dev`
-- `npm run build`
-- `npm run lint`
-- `npm run preview`
+## Primary Files
+- Frontend core: `web/src/App.jsx`
+- Frontend styles: `web/src/App.css`
+- Frontend entry: `web/src/main.jsx`
+- Main network file: `web/public/Sewerage_Network_Main_Pipelines.geojson`
+- Backend API: `server/src/index.js`
+- Root startup script: `start-dev.sh`
+- Product docs: `README.md`
 
-Note: in some shells, `npm` may be missing. If commands fail with `command not found: npm`, install Node/npm first and re-run validations.
+## Run Commands
+From repo root (preferred):
+- `./start-dev.sh`
 
-## Key Files
-- App entry: `web/src/main.jsx`
-- Main logic/UI: `web/src/App.jsx` (large, ~1400+ lines)
-- Styles: `web/src/App.css`, `web/src/index.css`
-- Primary network data: `web/public/Sewerage_Network_Main_Pipelines.geojson` (~2.6 MB)
-- Optional cleaned variants: `web/public/Sewerage_Network_Main_Pipelines_cleaned_20m.geojson`, `web/public/Sewerage_Network_Main_Pipelines_cleaned_40m.geojson`
-- Data tooling: `web/public/geojson_to_flow_svg.py`
-- Historical snapshots: `web/src/Backup/*.jsx`, plus `App.jsx.bak` and `App.jsx.broken-backup`
+Manual split run:
+- Backend:
+  - `cd server && npm install && npm run dev`
+- Frontend:
+  - `cd web && npm install && VITE_API_BASE_URL=http://localhost:8787 npm run dev`
 
-## App Behavior Summary
-`web/src/App.jsx` does all core work:
-- Loads GeoJSON at startup from `/Sewerage_Network_Main_Pipelines.geojson`.
-- Computes per-pipe hydraulic velocity (`_v_half_mps`) from Manning assumptions.
-- Reads/normalizes direction from `DIR` (fallback `u_to_d`).
-- Builds graph connectivity using snapped endpoint node keys (`_upNodeKey`, `_downNodeKey`, `_nextObjectIds`).
-- Uses browser geolocation for spawn center (fallback near Elsternwick).
-- For each flush point:
-  - Finds nearest pipe contact point.
-  - Requests OSRM road route to that contact.
-  - Enters pipe mode and traverses directed network path.
-- Animates points on a fixed interval tick.
+Validation:
+- Frontend:
+  - `cd web && npm run lint`
+  - `cd web && npm run build`
+- Backend:
+  - `node --check server/src/index.js`
 
-## Data Contract Notes
-Observed GeoJSON properties used in logic include:
-- `OBJECTID`
-- `SEWER_NAME` / `SEWERNAME`
-- `DIR`
-- `MATERIAL`
-- `GRADE`
-- `UPSTREAM_IL`
-- `DOWNSTREAM_IL`
-- `PIPE_LENGTH`
-- `PIPE_WIDTH`
-- `PIPE_HEIGHT`
+## API Surface (Current)
+- `GET /api/time`
+- `GET /api/flushes?status=active`
+- `POST /api/flushes`
+- `PATCH /api/flushes/:id/status`
+- `GET /api/events` (SSE: `flush_created`, `flush_status_updated`, `heartbeat`)
 
-Derived/internal properties written onto each feature:
-- `_manning_n`
-- `_slope_S`
-- `_v_half_mps`
-- `_dir`
-- `_dir_source`
-- `_sewer_name_norm`
-- `_upNodeKey`
-- `_downNodeKey`
-- `_nextObjectIds`
+## Data + Routing Notes
+- Keep compatibility with existing persisted shape in `flush_runs` table.
+- Treat replay model as source of truth after restart (elapsed wall-clock time).
+- Do not silently mark runs as arrived unless terminal endpoint was reached.
+- Prefer network-following connector fallback paths over straight-line bridges.
 
-When editing traversal logic, preserve these names to avoid breaking popups and animation state.
+## Working Rules For Agents
+1. Start by checking repo state:
+   - `git status --short`
+2. Scope changes narrowly to requested behavior.
+3. Avoid editing backup snapshots unless explicitly requested:
+   - `web/src/App.jsx.bak`
+   - `web/src/Backup/*`
+4. If behavior changes, run relevant validation before handoff.
+5. Update docs (`README.md`/`AGENTS.md`) when behavior or run steps change.
 
-## Agent Workflow (Recommended)
-1. Start with `git -C <repo> status --short`.
-2. Work inside `web/` unless task explicitly targets repo root docs.
-3. Read `web/src/App.jsx` before changing behavior; many helpers are interdependent.
-4. Keep changes narrow and avoid touching backup snapshots unless explicitly asked.
-5. Validate with:
-   - `npm run lint`
-   - `npm run build`
-6. If runtime behavior changed, run `npm run dev` and manually verify:
-   - map loads
-   - GeoJSON renders
-   - click-to-flush works
-   - street route appears
-   - marker transitions to pipe mode and progresses
+## Commit Prompt Requirement
+After you successfully land requested code changes and validations:
+1. Summarize what changed and what checks ran.
+2. Prompt the user to commit in a direct question.
+3. If they confirm, use existing repo identity (or latest commit identity if unset), then commit.
+
+Suggested wording:
+- "Changes are landed and checks passed. Do you want me to commit these changes now?"
+
+If checks could not run, state that clearly before asking to commit.
 
 ## Known Footguns
-- `App.jsx` is monolithic; small edits can have broad effects.
-- There is duplicated speed-toggle button markup in sidebar; avoid introducing further UI duplication.
-- Popup content includes a few debug-looking template strings for virtual-next fields; review carefully before relying on those values.
-- `_sharedDownstream` is referenced in styling but may not always be populated.
-- Network traversal quality depends on source data `DIR` and endpoint snapping tolerance.
-- OSRM demo service can rate-limit/fail; app currently treats failures as point errors.
-
-## Geospatial/Performance Guidance
-- Avoid recomputing full-feature scans inside render paths.
-- Keep expensive graph preprocessing in startup effects/memoized paths.
-- If changing coordinate math, document units (meters vs lat/lng degrees) explicitly.
-- For large dataset changes, sanity-check feature count and bounds after load.
+- `web/src/App.jsx` is large and stateful; small edits can affect routing/animation.
+- OSRM demo API may fail/rate-limit and can create street-route errors.
+- SSE and startup rehydrate can race; keep event handlers idempotent by flush `id`.
+- Large GeoJSON rendering can regress performance if frequent full re-renders are reintroduced.
