@@ -11,6 +11,24 @@
   padding: 14px;
   box-sizing: border-box;
   overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebarTop {
+  min-height: 0;
+}
+
+.sidebarBottom {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid #26282c;
+}
+
+.sidebarSectionTitle {
+  font-size: 18px;
+  font-weight: 700;
+  margin-bottom: 8px;
 }
 
 .counter {
@@ -42,20 +60,158 @@
   background: #2d8ad6;
 }
 
-.sidebar pre {
-  margin-top: 12px;
-  padding: 10px;
-  background: #151516;
-  border-radius: 8px;
-  font-size: 11px;
-  line-height: 1.3;
-  overflow: auto;
-  max-height: 40vh;
-}
-
 .map {
   flex: 1;
   position: relative;
+}
+
+.poo-marker {
+  font-size: 22px;
+  line-height: 24px;
+  text-align: center;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.35));
+}
+
+.pointLabel {
+  line-height: 1.2;
+}
+
+.pointLabelName {
+  font-weight: 700;
+}
+
+.pointLabelMeta {
+  font-size: 11px;
+  opacity: 0.85;
+}
+
+.settingsFab {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 900;
+  border: 0;
+  border-radius: 999px;
+  padding: 9px 14px;
+  background: rgba(15, 15, 16, 0.9);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.settingsFab:hover {
+  background: rgba(15, 15, 16, 1);
+}
+
+.recenterFab {
+  position: absolute;
+  top: 56px;
+  right: 14px;
+  z-index: 900;
+  border: 0;
+  border-radius: 999px;
+  padding: 9px 14px;
+  background: rgba(15, 15, 16, 0.88);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.recenterFab:hover {
+  background: rgba(15, 15, 16, 1);
+}
+
+.settingsModalBackdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 1200;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 20px;
+  box-sizing: border-box;
+}
+
+.settingsModal {
+  width: min(560px, 100%);
+  max-height: calc(100vh - 40px);
+  overflow: auto;
+  background: #111214;
+  color: #fff;
+  border-radius: 12px;
+  border: 1px solid #26282c;
+  padding: 14px;
+  box-sizing: border-box;
+}
+
+.settingsModalHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.settingsModalHeader h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.settingsCloseBtn {
+  border: 0;
+  border-radius: 6px;
+  padding: 7px 10px;
+  background: #23252b;
+  color: #fff;
+  cursor: pointer;
+}
+
+.settingsSection {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #26282c;
+}
+
+.settingsSection h4 {
+  margin: 0 0 8px 0;
+  font-size: 13px;
+  opacity: 0.86;
+}
+
+.settingsSection button {
+  width: 100%;
+  border: 0;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 6px 0;
+  background: #2f91e5;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.settingsSection button:hover {
+  background: #2d8ad6;
+}
+
+@media (max-width: 900px) {
+  .sidebar {
+    width: 200px;
+  }
+
+  .settingsFab {
+    top: 10px;
+    right: 10px;
+  }
+
+  .recenterFab {
+    top: 50px;
+    right: 10px;
+  }
 }
 
 /* Makes magenta pipes stand out a bit more */

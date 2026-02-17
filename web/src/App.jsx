@@ -1,10 +1,34 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 import "leaflet/dist/leaflet.css";
-import { MapContainer, TileLayer, GeoJSON, CircleMarker, Popup, Polyline, Tooltip, useMapEvents } from "react-leaflet";
+import { divIcon } from "leaflet";
+import { MapContainer, TileLayer, GeoJSON, CircleMarker, Marker, Popup, Polyline, Tooltip, useMapEvents } from "react-leaflet";
 
 const users = ["Tom", "Steph", "Molly", "Delilah", "Luella"];
+const APP_LAST_UPDATED = "2026-02-12 09:05 UTC";
+const PERF_MODE_DEFAULT = "mobile";
+const ANIMATION_FPS_TARGET = 30;
+const UI_SYNC_FPS = 6;
+const SHOW_PIPE_GLOW_DEFAULT = false;
+const SEGMENT_INDEX_CELL_M = 80;
+const NODE_INDEX_CELL_M = 120;
+const FALLBACK_MAX_BRIDGE_M = 250;
+const ROUTING_FALLBACK_DEFAULT = "guarantee_endpoint";
+const PIPE_GEOJSON_PATH = "/Sewerage_Network_Main_Pipelines.geojson";
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8787";
+const TRUE_ENDPOINT_NAME_PRIORITY = [
+  "WESTERN TRUNK SEWER",
+  "SOUTH EASTERN TRUNK SEWER",
+  "SOUTH EASTERN OUTFALL"
+];
+const MAX_CONNECTOR_VISITS = 50000;
+const POO_ICON = divIcon({
+  className: "poo-marker",
+  html: "💩",
+  iconSize: [24, 24],
+  iconAnchor: [12, 12]
+});
 
 // Fallback centre (Elsternwick-ish) if geolocation is blocked/unavailable
 const FALLBACK_CENTER = { lat: -37.885, lng: 145.01 };
@@ -24,6 +48,30 @@ const PIPE_SPEED_MIN_MPS = 0.2;
 const PIPE_SPEED_MAX_MPS = 3.0;
 
 const R_MERC = 6378137;
+
+function perfLog(label, payload) {
+  if (!import.meta.env.DEV) return;
+  if (payload === undefined) {
+    console.log(`[PERF] ${label}`);
+    return;
+  }
+  console.log(`[PERF] ${label}`, payload);
+}
+
+async function apiFetch(path, options = {}) {
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    }
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${path} failed: ${res.status} ${text}`);
+  }
+  return res.status === 204 ? null : res.json();
+}
 
 function clamp(n, a, b) {
   return Math.max(a, Math.min(b, n));
@@ -78,6 +126,56 @@ function routeDistanceMeters(route) {
     d += metersBetween(route[i - 1], route[i]);
   }
   return d;
+}
+
+function interpolatePoint(a, b, f) {
+  return {
+    lat: a.lat + (b.lat - a.lat) * f,
+    lng: a.lng + (b.lng - a.lng) * f
+  };
+}
+
+function locateAlongPath(path, metersFromStart) {
+  if (!Array.isArray(path) || path.length === 0) return { point: null, nextIdx: 0, traveledM: 0 };
+  if (path.length === 1) return { point: path[0], nextIdx: 1, traveledM: 0 };
+  const clamped = Math.max(0, metersFromStart);
+  let rem = clamped;
+  for (let i = 1; i < path.length; i++) {
+    const seg = metersBetween(path[i - 1], path[i]);
+    if (seg <= 0) continue;
+    if (rem <= seg) {
+      const f = rem / seg;
+      return { point: interpolatePoint(path[i - 1], path[i], f), nextIdx: i, traveledM: clamped };
+    }
+    rem -= seg;
+  }
+  return { point: path[path.length - 1], nextIdx: path.length, traveledM: clamped };
+}
+
+function remainingDistanceOnPath(path, idx, currentLL) {
+  if (!Array.isArray(path) || !currentLL) return 0;
+  const target = path[idx];
+  if (!target) return 0;
+  let d = metersBetween(currentLL, target);
+  for (let i = idx + 1; i < path.length; i++) {
+    d += metersBetween(path[i - 1], path[i]);
+  }
+  return d;
+}
+
+function formatEta(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return "—";
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return `${s}s`;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+  return `${m}:${String(ss).padStart(2, "0")}`;
+}
+
+function toDisplaySpeed(v) {
+  return Number.isFinite(v) ? v.toFixed(2) : "—";
 }
 
 function projectToXYMeters(origin, p) {
@@ -227,6 +325,51 @@ function findNearestPipeContact(geojson, start) {
   return best;
 }
 
+function findNearestPipeContactWithIndex(features, segmentIndex, start) {
+  if (!segmentIndex?.cells) return null;
+
+  const originKey = segmentCellKeyFromLngLat(start.lng, start.lat, segmentIndex.cellM);
+  const [cx, cy] = originKey.split(",").map(Number);
+  let best = null;
+  const maxRing = 12;
+
+  for (let ring = 0; ring <= maxRing; ring++) {
+    const seen = new Set();
+
+    for (let x = cx - ring; x <= cx + ring; x++) {
+      for (let y = cy - ring; y <= cy + ring; y++) {
+        if (ring > 0 && x !== cx - ring && x !== cx + ring && y !== cy - ring && y !== cy + ring) continue;
+        const key = `${x},${y}`;
+        const segs = segmentIndex.cells.get(key);
+        if (!segs) continue;
+
+        for (const seg of segs) {
+          const segKey = `${seg.featureIndex}:${seg.partIndex}:${seg.segIndex}`;
+          if (seen.has(segKey)) continue;
+          seen.add(segKey);
+
+          const res = closestPointOnSegment(seg.a, seg.b, start);
+          if (!best || res.dist < best.dist) {
+            best = {
+              dist: res.dist,
+              point: res.point,
+              feature: features[seg.featureIndex],
+              partIndex: seg.partIndex,
+              segIndex: seg.segIndex,
+              segA: seg.a,
+              segB: seg.b
+            };
+          }
+        }
+      }
+    }
+
+    if (best && best.dist <= (ring + 1) * segmentIndex.cellM) break;
+  }
+
+  return best;
+}
+
 async function fetchOsrmRoute(start, end) {
   const url =
     `${OSRM_ROUTE_URL}/` +
@@ -256,6 +399,230 @@ function nodeKeyFromLngLat(lng, lat, tolM) {
   const kx = Math.round(m.x / tolM);
   const ky = Math.round(m.y / tolM);
   return `${kx}_${ky}`;
+}
+
+function segmentCellKeyFromLngLat(lng, lat, cellM) {
+  const m = mercatorMetersFromLngLat(lng, lat);
+  const x = Math.floor(m.x / cellM);
+  const y = Math.floor(m.y / cellM);
+  return `${x},${y}`;
+}
+
+function buildSegmentSpatialIndex(features, cellM = SEGMENT_INDEX_CELL_M) {
+  const cells = new Map();
+
+  function pushSegment(seg, minX, minY, maxX, maxY) {
+    for (let x = minX; x <= maxX; x++) {
+      for (let y = minY; y <= maxY; y++) {
+        const key = `${x},${y}`;
+        const arr = cells.get(key);
+        if (arr) arr.push(seg);
+        else cells.set(key, [seg]);
+      }
+    }
+  }
+
+  features.forEach((ft, featureIndex) => {
+    const g = ft?.geometry;
+    if (!g) return;
+
+    const addLine = (coords, partIndex) => {
+      for (let i = 0; i < coords.length - 1; i++) {
+        const a = { lng: coords[i][0], lat: coords[i][1] };
+        const b = { lng: coords[i + 1][0], lat: coords[i + 1][1] };
+        const am = mercatorMetersFromLngLat(a.lng, a.lat);
+        const bm = mercatorMetersFromLngLat(b.lng, b.lat);
+        const minX = Math.floor(Math.min(am.x, bm.x) / cellM);
+        const maxX = Math.floor(Math.max(am.x, bm.x) / cellM);
+        const minY = Math.floor(Math.min(am.y, bm.y) / cellM);
+        const maxY = Math.floor(Math.max(am.y, bm.y) / cellM);
+        pushSegment({ featureIndex, partIndex, segIndex: i, a, b }, minX, minY, maxX, maxY);
+      }
+    };
+
+    if (g.type === "LineString") addLine(g.coordinates || [], 0);
+    else if (g.type === "MultiLineString") {
+      const lines = g.coordinates || [];
+      for (let li = 0; li < lines.length; li++) addLine(lines[li] || [], li);
+    }
+  });
+
+  return { cellM, cells };
+}
+
+function buildNodeSpatialIndex(nodes, cellM = NODE_INDEX_CELL_M) {
+  const cells = new Map();
+  for (const node of nodes) {
+    const key = segmentCellKeyFromLngLat(node.lng, node.lat, cellM);
+    const arr = cells.get(key);
+    if (arr) arr.push(node);
+    else cells.set(key, [node]);
+  }
+  return { cellM, cells };
+}
+
+function findNearestDownstreamNode(pointLL, nodeSpatialIndex, maxMeters, excludeKeys = new Set()) {
+  if (!nodeSpatialIndex?.cells) return null;
+  const originKey = segmentCellKeyFromLngLat(pointLL.lng, pointLL.lat, nodeSpatialIndex.cellM);
+  const [cx, cy] = originKey.split(",").map(Number);
+  const maxRing = Math.max(1, Math.ceil(maxMeters / nodeSpatialIndex.cellM));
+  let best = null;
+  let bestDist = Infinity;
+
+  for (let ring = 0; ring <= maxRing; ring++) {
+    for (let x = cx - ring; x <= cx + ring; x++) {
+      for (let y = cy - ring; y <= cy + ring; y++) {
+        if (ring > 0 && x !== cx - ring && x !== cx + ring && y !== cy - ring && y !== cy + ring) continue;
+        const nodes = nodeSpatialIndex.cells.get(`${x},${y}`);
+        if (!nodes) continue;
+        for (const node of nodes) {
+          if (excludeKeys.has(node.key)) continue;
+          if (!Array.isArray(node.outObjectIds) || node.outObjectIds.length === 0) continue;
+          const d = metersBetween(pointLL, { lat: node.lat, lng: node.lng });
+          if (d < bestDist) {
+            bestDist = d;
+            best = node;
+          }
+        }
+      }
+    }
+  }
+
+  if (!best || bestDist > maxMeters) return null;
+  return { node: best, dist: bestDist };
+}
+
+function nearestPointOnOrderedPipe(ord, fromPoint) {
+  if (!Array.isArray(ord) || ord.length < 2 || !fromPoint) return null;
+  let best = null;
+  for (let i = 0; i < ord.length - 1; i++) {
+    const a = ord[i];
+    const b = ord[i + 1];
+    const res = closestPointOnSegment(a, b, fromPoint);
+    if (!best || res.dist < best.dist) {
+      best = { point: res.point, dist: res.dist };
+    }
+  }
+  return best;
+}
+
+function nearestNodeKeyForPoint(fromPoint, nodeIndex) {
+  if (!fromPoint || !nodeIndex || nodeIndex.size === 0) return null;
+  let bestKey = null;
+  let bestDist = Infinity;
+  for (const [key, n] of nodeIndex.entries()) {
+    const d = metersBetween(fromPoint, { lat: n.lat, lng: n.lng });
+    if (d < bestDist) {
+      bestDist = d;
+      bestKey = key;
+    }
+  }
+  return bestKey;
+}
+
+function findBestPurpleConnectorPath({
+  fromPoint,
+  fromNodeKey,
+  nodeAdj,
+  reachableEntryNodeKeys,
+  nodeIndex,
+  pipeCanReachTerminal,
+  pipeDistToTerminalM
+}) {
+  if (!fromPoint || !nodeAdj || !reachableEntryNodeKeys || !nodeIndex || !pipeCanReachTerminal || !pipeDistToTerminalM) return null;
+  const startKey = fromNodeKey && nodeIndex.has(fromNodeKey) ? fromNodeKey : nearestNodeKeyForPoint(fromPoint, nodeIndex);
+  if (!startKey) return null;
+
+  const dist = new Map([[startKey, 0]]);
+  const prev = new Map();
+  const unvisited = new Set([startKey]);
+  const visited = new Set();
+  let visits = 0;
+
+  while (unvisited.size > 0 && visits < MAX_CONNECTOR_VISITS) {
+    visits += 1;
+    let currKey = null;
+    let currDist = Infinity;
+    for (const k of unvisited) {
+      const d = dist.get(k) ?? Infinity;
+      if (d < currDist) {
+        currDist = d;
+        currKey = k;
+      }
+    }
+    if (currKey === null) break;
+    unvisited.delete(currKey);
+    if (visited.has(currKey)) continue;
+    visited.add(currKey);
+
+    const edges = nodeAdj.get(currKey) || [];
+    for (const edge of edges) {
+      const nextKey = edge.toKey;
+      const nd = currDist + (edge.meters || 0);
+      if (nd < (dist.get(nextKey) ?? Infinity)) {
+        dist.set(nextKey, nd);
+        prev.set(nextKey, { fromKey: currKey, edge });
+        if (!visited.has(nextKey)) unvisited.add(nextKey);
+      }
+    }
+  }
+
+  let best = null;
+  for (const entryKey of reachableEntryNodeKeys) {
+    if (!dist.has(entryKey)) continue;
+    const entryNode = nodeIndex.get(entryKey);
+    if (!entryNode || !Array.isArray(entryNode.outObjectIds) || entryNode.outObjectIds.length === 0) continue;
+
+    let resumeStartPipeId = null;
+    let downstreamM = Infinity;
+    for (const oid of entryNode.outObjectIds) {
+      if (!pipeCanReachTerminal.has(oid)) continue;
+      const d = pipeDistToTerminalM.get(oid);
+      if (!Number.isFinite(d)) continue;
+      if (d < downstreamM) {
+        downstreamM = d;
+        resumeStartPipeId = oid;
+      }
+    }
+    if (resumeStartPipeId === null) continue;
+
+    const connectorM = dist.get(entryKey) ?? Infinity;
+    const totalM = connectorM + downstreamM;
+    if (!best || totalM < best.totalM || (totalM === best.totalM && connectorM < best.connectorMeters)) {
+      best = { entryKey, resumeStartPipeId, connectorMeters: connectorM, totalM };
+    }
+  }
+  if (!best) return null;
+
+  const pathEdges = [];
+  let k = best.entryKey;
+  while (k !== startKey) {
+    const link = prev.get(k);
+    if (!link) break;
+    pathEdges.push(link.edge);
+    k = link.fromKey;
+  }
+  pathEdges.reverse();
+
+  const connectorPathCoords = [];
+  for (const edge of pathEdges) {
+    const coords = edge.coords || [];
+    for (let i = 0; i < coords.length; i++) {
+      const pt = coords[i];
+      const last = connectorPathCoords[connectorPathCoords.length - 1];
+      if (last && metersBetween(last, pt) < 0.2) continue;
+      connectorPathCoords.push(pt);
+    }
+  }
+  const entryNode = nodeIndex.get(best.entryKey);
+  const entryPoint = entryNode ? { lat: entryNode.lat, lng: entryNode.lng } : fromPoint;
+  return {
+    connectorPathCoords,
+    connectorMeters: best.connectorMeters,
+    entryNodeKey: best.entryKey,
+    entryPoint,
+    resumeStartPipeId: best.resumeStartPipeId
+  };
 }
 
 function manningNFromMaterial(materialRaw) {
@@ -387,7 +754,7 @@ function chooseNextPipeLowestDownIL(nextIds, byObjectId, currentProps) {
 }
 
 
-function chooseNextPipeWithLookahead(candidateIds, byObjectId, currProps, currId, prevId, visited) {
+function _chooseNextPipeWithLookahead(candidateIds, byObjectId, currProps, currId, prevId, visited) {
   const ids0 = Array.isArray(candidateIds) ? candidateIds : [];
   if (ids0.length === 0) return null;
 
@@ -478,7 +845,7 @@ function lookaheadScore(startId, byObjectId, currProps, currId, prevId, visited,
   return total;
 }
 
-function findNearestObjectIdBySewerNameFromByObjectId(byObjectId, pointLL, sewerNameRaw, excludeIds, maxMeters) {
+function _findNearestObjectIdBySewerNameFromByObjectId(byObjectId, pointLL, sewerNameRaw, excludeIds, maxMeters) {
   const target = String(sewerNameRaw || "").trim();
   if (!target) return null;
 
@@ -556,27 +923,55 @@ function chooseNextPipeByBearing(nextIds, byObjectId, currOrderedCoords, prevId,
   return bestId !== null ? bestId : (ids.slice().sort((a, b) => a - b)[0] ?? null);
 }
 
-function buildPipePlanFromObjectId(startObjectId, startPoint, byObjectId, maxHops = 2000) {
+function buildPipePlanFromObjectId(
+  startObjectId,
+  startPoint,
+  byObjectId,
+  nodeIndex,
+  maxHops = 2000,
+  initialVisited = null,
+  pipeCanReachTerminal = null,
+  nextHopToTerminal = null
+) {
   // DIR-first traversal:
   // - Each pipe has an explicit DIR (u_to_d / d_to_u). We treat this as authoritative.
   // - Connectivity is: current pipe FLOW-END node -> next pipe FLOW-START node.
   // - `_nextObjectIds` is built from endpoint snapping + flow-start matching (plus a small fallback).
   const plan = [];
-  const visited = new Set();
+  const visited = initialVisited ? new Set(initialVisited) : new Set();
   const visitedCells = new Set();
 
   let currentId = startObjectId;
   let prevId = null;
   let first = true;
+  let endReason = "missing_feature";
+  let lastNodeKey = null;
+  let lastObjectId = null;
+  let terminalNode = null;
 
-  while (currentId !== null && currentId !== undefined && !visited.has(currentId) && visited.size < maxHops) {
+  while (currentId !== null && currentId !== undefined && visited.size < maxHops) {
+    if (pipeCanReachTerminal && !pipeCanReachTerminal.has(currentId)) {
+      endReason = "unreachable_subgraph";
+      break;
+    }
+    if (visited.has(currentId)) {
+      endReason = "loop";
+      break;
+    }
     const ft = byObjectId.get(currentId);
-    if (!ft) break;
+    if (!ft) {
+      endReason = "missing_feature";
+      break;
+    }
 
     visited.add(currentId);
+    lastObjectId = currentId;
 
     const ord = orderedCoordsForPipe(ft);
-    if (ord.length < 2) break;
+    if (ord.length < 2) {
+      endReason = "missing_feature";
+      break;
+    }
 
     if (first && startPoint) {
       plan.push({ lng: startPoint.lng, lat: startPoint.lat });
@@ -613,7 +1008,23 @@ function buildPipePlanFromObjectId(startObjectId, startPoint, byObjectId, maxHop
 
     const p = ft.properties || {};
     const nextIds = Array.isArray(p._nextObjectIds) ? p._nextObjectIds : [];
-    const nextId = chooseNextPipeByBearing(nextIds, byObjectId, ord, prevId, visited);
+    let nextId = null;
+    if (nextHopToTerminal && nextHopToTerminal.has(currentId)) {
+      const preferred = nextHopToTerminal.get(currentId);
+      if (
+        preferred !== null &&
+        preferred !== undefined &&
+        nextIds.includes(preferred) &&
+        !visited.has(preferred) &&
+        preferred !== prevId
+      ) {
+        nextId = preferred;
+      }
+    }
+    if (nextId === null || nextId === undefined) {
+      nextId = chooseNextPipeByBearing(nextIds, byObjectId, ord, prevId, visited);
+    }
+    lastNodeKey = p._downNodeKey || null;
 
     if (visited.size < 120) {
       console.log(
@@ -629,15 +1040,36 @@ function buildPipePlanFromObjectId(startObjectId, startPoint, byObjectId, maxHop
       );
     }
 
+    if (nextId === null || nextId === undefined) {
+      const dn = lastNodeKey ? nodeIndex?.get(lastNodeKey) : null;
+      const isTerminal = !!dn && Array.isArray(dn.outObjectIds) && dn.outObjectIds.length === 0 && Array.isArray(dn.inObjectIds) && dn.inObjectIds.length > 0;
+      if (isTerminal) {
+        endReason = "terminal";
+        terminalNode = { key: dn.key, lat: dn.lat, lng: dn.lng };
+      } else {
+        endReason = "dead_end";
+      }
+      break;
+    }
+
     prevId = currentId;
     currentId = nextId;
   }
+  if (visited.size >= maxHops && endReason !== "terminal") endReason = "max_hops";
 
-  return plan;
+  return {
+    coords: plan,
+    endReason,
+    lastNodeKey,
+    lastPoint: plan.length > 0 ? plan[plan.length - 1] : startPoint,
+    visitedObjectIds: Array.from(visited),
+    lastObjectId,
+    terminalNode
+  };
 }
 
 
-function findNearestNodeKeyWithinMeters(nodeIndex, fromKey, maxMeters) {
+function _findNearestNodeKeyWithinMeters(nodeIndex, fromKey, maxMeters) {
   const from = nodeIndex.get(fromKey);
   if (!from) return null;
 
@@ -663,7 +1095,7 @@ function findNearestNodeKeyWithinMeters(nodeIndex, fromKey, maxMeters) {
   return bestKey;
 }
 
-function findNearestPipeObjectIdToPointWithinMeters(geojson, pointLL, excludeObjectId, maxMeters) {
+function _findNearestPipeObjectIdToPointWithinMeters(geojson, pointLL, excludeObjectId, maxMeters) {
   const features = Array.isArray(geojson?.features) ? geojson.features : [];
 
   let bestObjectId = null;
@@ -703,7 +1135,7 @@ function findNearestPipeObjectIdToPointWithinMeters(geojson, pointLL, excludeObj
   return null;
 }
 
-function findNearestPipeObjectIdBySewerNameWithinMeters(geojson, pointLL, sewerNameRaw, excludeObjectId, maxMeters) {
+function _findNearestPipeObjectIdBySewerNameWithinMeters(geojson, pointLL, sewerNameRaw, excludeObjectId, maxMeters) {
   const targetName = normaliseSewerName(sewerNameRaw);
   if (!targetName) return null;
 
@@ -748,8 +1180,340 @@ function findNearestPipeObjectIdBySewerNameWithinMeters(geojson, pointLL, sewerN
   return null;
 }
 
+const PipeGeoJsonLayer = memo(function PipeGeoJsonLayer({ geojson, showPipeGlow, perfMode }) {
+  useEffect(() => {
+    perfLog("overlay checkpoint: pipe layer rendered", {
+      perfMode,
+      features: Array.isArray(geojson?.features) ? geojson.features.length : 0
+    });
+  }, [geojson, perfMode]);
+
+  if (!geojson) return null;
+
+  return (
+    <GeoJSON
+      data={geojson}
+      style={(feature) => ({
+        color: feature?.properties?._sharedDownstream ? "#007bff" : "#ff00ff",
+        weight: perfMode === "mobile" ? 2.5 : 4,
+        opacity: perfMode === "mobile" ? 0.8 : 0.95,
+        className: showPipeGlow ? "pipe-glow" : undefined
+      })}
+      onEachFeature={(feature, layer) => {
+        const p = feature?.properties || {};
+        const v = toNum(p._v_half_mps);
+        const vTxt = v !== null ? `${v.toFixed(2)} m/s` : "—";
+        layer.bindPopup(
+          `<div style="font-family: sans-serif; font-size: 12px;">
+            <div><b>OBJECTID:</b> ${p.OBJECTID ?? "—"}</div>
+            <div><b>SEWER_NAME:</b> ${p.SEWER_NAME ?? "—"}</div>
+            <div><b>Material:</b> ${p.MATERIAL ?? "—"} <span style="opacity:0.7">(n=${p._manning_n ?? "—"})</span></div>
+            <div><b>Size (W/H mm):</b> ${p.PIPE_WIDTH ?? "—"} / ${p.PIPE_HEIGHT ?? "—"}</div>
+            <div><b>Pipe length:</b> ${p.PIPE_LENGTH ?? "—"}</div>
+            <div><b>Slope (GRADE):</b> ${p.GRADE ?? "—"}</div>
+            <div><b>Up IL / Down IL:</b> ${p.UPSTREAM_IL ?? "—"} / ${p.DOWNSTREAM_IL ?? "—"}</div>
+            <div><b>Velocity (half-full):</b> ${vTxt}</div>
+          </div>`
+        );
+      }}
+    />
+  );
+});
+
+const StreetRoutesLayer = memo(function StreetRoutesLayer({ points, showStreetRoutes }) {
+  if (!showStreetRoutes) return null;
+
+  return points
+    .filter((p) => p.street?.visible && Array.isArray(p.street.route) && p.street.route.length > 1)
+    .map((p) => (
+      <Polyline
+        key={`street-${p.id}`}
+        positions={p.street.route.map((pt) => [pt.lat, pt.lng])}
+        pathOptions={{
+          color: "#8b5a2b",
+          weight: 4,
+          opacity: 0.8
+        }}
+      >
+        <Popup>
+          <div>
+            <div>
+              <b>{p.name}</b> street route
+            </div>
+            <div>Distance: {Math.round(p.street.distM || 0)} m</div>
+            <div>Speed: {p.street.speedMps?.toFixed(2)} m/s</div>
+            <div>ETA: {Math.round(p.street.etaS || 0)} s</div>
+            <div>
+              Destination pipe OBJECTID:{" "}
+              {p.contact?.pipeObjectId !== null && p.contact?.pipeObjectId !== undefined ? p.contact.pipeObjectId : "—"}
+            </div>
+          </div>
+        </Popup>
+      </Polyline>
+    ));
+});
+
+const PipePlansLayer = memo(function PipePlansLayer({ points, showPipePlans, byObjectId }) {
+  if (!showPipePlans) return null;
+
+  return points
+    .filter((p) => Array.isArray(p.pipePlan) && p.pipePlan.length > 1)
+    .map((p) => (
+      <Polyline
+        key={`pipeplan-${p.id}`}
+        positions={p.pipePlan.map((pt) => [pt.lat, pt.lng])}
+        pathOptions={{
+          color: "#00aa00",
+          weight: 5,
+          opacity: 0.85
+        }}
+      >
+        <Popup>
+          {(() => {
+            const startId = p.contact?.pipeObjectId ?? null;
+            const startFt = startId !== null && byObjectId ? byObjectId.get(startId) : null;
+            const sp = startFt?.properties || {};
+            const v = typeof sp._v_half_mps === "number" ? sp._v_half_mps : parseFloat(sp._v_half_mps);
+            const vTxt = Number.isFinite(v) ? `${v.toFixed(2)} m/s` : "—";
+            return (
+              <div style={{ fontFamily: "sans-serif", fontSize: 12 }}>
+                <div><b>OBJECTID:</b> {sp.OBJECTID ?? "—"}</div>
+                <div><b>SEWER_NAME:</b> {sp.SEWER_NAME ?? "—"}</div>
+                <div><b>Material:</b> {sp.MATERIAL ?? "—"} <span style={{ opacity: 0.7 }}>(n={sp._manning_n ?? "—"})</span></div>
+                <div><b>Size (W/H mm):</b> {sp.PIPE_WIDTH ?? "—"} / {sp.PIPE_HEIGHT ?? "—"}</div>
+                <div><b>Pipe length:</b> {sp.PIPE_LENGTH ?? "—"}</div>
+                <div><b>Slope (GRADE):</b> {sp.GRADE ?? "—"}</div>
+                <div><b>Up IL / Down IL:</b> {sp.UPSTREAM_IL ?? "—"} / {sp.DOWNSTREAM_IL ?? "—"}</div>
+                <div><b>Velocity (half-full):</b> {vTxt}</div>
+              </div>
+            );
+          })()}
+        </Popup>
+      </Polyline>
+    ));
+});
+
+const EndpointsLayer = memo(function EndpointsLayer({ terminalNodes, showEndpoints }) {
+  if (!showEndpoints || !Array.isArray(terminalNodes) || terminalNodes.length === 0) return null;
+  return terminalNodes.map((n) => (
+    <CircleMarker
+      key={`endpoint-${n.key}`}
+      center={[n.lat, n.lng]}
+      radius={6}
+      pathOptions={{ color: "#00bcd4", fillColor: "#00bcd4", fillOpacity: 0.85, weight: 2 }}
+    >
+      <Popup>
+        <div>
+          <div><b>Endpoint node</b></div>
+          <div>Key: {n.key}</div>
+          <div>Incoming: {n.inCount}</div>
+          <div>Outgoing: {n.outCount}</div>
+          <div>Incoming OBJECTIDs: {n.inObjectIds.slice(0, 10).join(", ") || "—"}</div>
+        </div>
+      </Popup>
+    </CircleMarker>
+  ));
+});
+
+const FallbackBridgeLayer = memo(function FallbackBridgeLayer({ points, showFallbackBridges }) {
+  if (!showFallbackBridges) return null;
+  return points
+    .filter(
+      (p) =>
+        p.fallbackBridge &&
+        ((Array.isArray(p.fallbackBridge.path) && p.fallbackBridge.path.length > 1) ||
+          (p.fallbackBridge.from && p.fallbackBridge.to))
+    )
+    .map((p) => (
+      <Polyline
+        key={`fallback-bridge-${p.id}`}
+        positions={
+          Array.isArray(p.fallbackBridge.path) && p.fallbackBridge.path.length > 1
+            ? p.fallbackBridge.path.map((pt) => [pt.lat, pt.lng])
+            : [
+                [p.fallbackBridge.from.lat, p.fallbackBridge.from.lng],
+                [p.fallbackBridge.to.lat, p.fallbackBridge.to.lng]
+              ]
+        }
+        pathOptions={{
+          color: p.fallbackBridge.mode === "guarantee_endpoint" ? "#ff9800" : "#ff2d2d",
+          weight: 4,
+          opacity: 0.9,
+          dashArray: "8,8"
+        }}
+      >
+        <Popup>
+          <div>
+            <div><b>Fallback bridge</b></div>
+            <div>Mode: {p.fallbackBridge.mode}</div>
+            <div>Reason: {p.fallbackBridge.reason || p.fallbackReason || "—"}</div>
+            <div>Distance: {Math.round(p.fallbackBridge.meters || 0)} m</div>
+          </div>
+        </Popup>
+      </Polyline>
+    ));
+});
+
+const MovingPointsLayer = memo(function MovingPointsLayer({ points, showLabels, isMobileViewport }) {
+  return points.map((p) => (
+    <Marker
+      key={p.id}
+      position={[p.lat, p.lng]}
+      icon={POO_ICON}
+    >
+      <Popup>
+        <div>
+          <div>
+            <b>{p.name}</b>
+          </div>
+          <div>Mode: {p.mode}</div>
+          <div>Routing: {p.routingStatus || "—"}</div>
+          <div>Fallback used: {p.fallbackUsed ? "yes" : "no"}</div>
+          {p.fallbackUsed && <div>Fallback reason: {p.fallbackReason || "—"}</div>}
+          {p.terminalNode && <div>Terminal node: {p.terminalNode.key}</div>}
+          {p.mode === "pipe" && p.pipe?.speedMps !== undefined && (
+            <div>Pipe speed: {p.pipe.speedMps.toFixed(2)} m/s</div>
+          )}
+          {p.error && <div>{p.error}</div>}
+        </div>
+      </Popup>
+
+      {showLabels && (
+        <Tooltip permanent={!isMobileViewport} direction="right" offset={[10, 0]} opacity={0.9}>
+          <div className="pointLabel">
+            <div className="pointLabelName">{p.name}</div>
+            <div className="pointLabelMeta">Started {p.initiatedAtLabel || "—"}</div>
+            <div className="pointLabelMeta">
+              v {toDisplaySpeed(p.currentVelocityBaseMps)} m/s
+            </div>
+            <div className="pointLabelMeta">ETA {formatEta(p.etaToDestinationSec)}</div>
+          </div>
+        </Tooltip>
+      )}
+    </Marker>
+  ));
+});
+
+function SettingsModal({
+  isOpen,
+  onClose,
+  perfMode,
+  setPerfMode,
+  showLabels,
+  setShowLabels,
+  showPipeGlow,
+  setShowPipeGlow,
+  showEndpoints,
+  setShowEndpoints,
+  showFallbackBridges,
+  setShowFallbackBridges,
+  routingFallbackMode,
+  setRoutingFallbackMode,
+  showStreetRoutes,
+  setShowStreetRoutes,
+  showPipePlans,
+  setShowPipePlans,
+  speed10x,
+  setSpeed10x,
+  clickToFlush,
+  setClickToFlush
+}) {
+  if (!isOpen) return null;
+
+  return (
+    <div className="settingsModalBackdrop" onClick={onClose}>
+      <div className="settingsModal" onClick={(e) => e.stopPropagation()}>
+        <div className="settingsModalHeader">
+          <h3>Settings</h3>
+          <button className="settingsCloseBtn" onClick={onClose} aria-label="Close settings">
+            x
+          </button>
+        </div>
+
+        <div className="settingsSection">
+          <h4>Routing</h4>
+          <button
+            onClick={() =>
+              setRoutingFallbackMode((m) =>
+                m === "strict" ? "nearest_downstream_node" : m === "nearest_downstream_node" ? "guarantee_endpoint" : "strict"
+              )
+            }
+          >
+            Routing fallback:{" "}
+            {routingFallbackMode === "strict"
+              ? "Strict"
+              : routingFallbackMode === "nearest_downstream_node"
+                ? "Nearest downstream node"
+                : "Guarantee endpoint"}
+          </button>
+        </div>
+
+        <div className="settingsSection">
+          <h4>Overlay Visibility</h4>
+          <button onClick={() => setShowStreetRoutes((v) => !v)}>
+            {showStreetRoutes ? "Street routes: ON" : "Street routes: OFF"}
+          </button>
+          <button onClick={() => setShowPipePlans((v) => !v)}>
+            {showPipePlans ? "Pipe plans: ON" : "Pipe plans: OFF"}
+          </button>
+          <button onClick={() => setShowEndpoints((v) => !v)}>
+            {showEndpoints ? "Endpoints: ON" : "Endpoints: OFF"}
+          </button>
+          <button onClick={() => setShowFallbackBridges((v) => !v)}>
+            {showFallbackBridges ? "Fallback bridges: ON" : "Fallback bridges: OFF"}
+          </button>
+          <button onClick={() => setShowLabels((v) => !v)}>
+            {showLabels ? "Labels: ON" : "Labels: OFF"}
+          </button>
+        </div>
+
+        <div className="settingsSection">
+          <h4>Performance</h4>
+          <button
+            onClick={() =>
+              setPerfMode((m) => {
+                const next = m === "mobile" ? "desktop" : "mobile";
+                setShowPipeGlow(next === "desktop");
+                setShowLabels(next !== "mobile");
+                return next;
+              })
+            }
+          >
+            {perfMode === "mobile" ? "Perf mode: Mobile" : "Perf mode: Desktop"}
+          </button>
+          <button onClick={() => setShowPipeGlow((v) => !v)}>
+            {showPipeGlow ? "Pipe glow: ON" : "Pipe glow: OFF"}
+          </button>
+        </div>
+
+        <div className="settingsSection">
+          <h4>Simulation</h4>
+          <button onClick={() => setSpeed10x((v) => !v)}>
+            {speed10x ? "Speed: 10x" : "Speed: 1x"}
+          </button>
+          <button onClick={() => setClickToFlush((v) => !v)}>
+            {clickToFlush ? "Click-to-flush: ON" : "Click-to-flush: OFF"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 export default function App() {
+  const storedLoc =
+    typeof window !== "undefined" ? window.localStorage.getItem("flush:lastDeviceLoc") : null;
+  const parsedStoredLoc = (() => {
+    if (!storedLoc) return null;
+    try {
+      const obj = JSON.parse(storedLoc);
+      if (typeof obj?.lat === "number" && typeof obj?.lng === "number") return obj;
+    } catch {
+      return null;
+    }
+    return null;
+  })();
+
   const [flushes, setFlushes] = useState(0);
 
   const [clickToFlush, setClickToFlush] = useState(false);
@@ -761,26 +1525,71 @@ export default function App() {
     bbox: null,
     count: 0,
     nodeCount: 0,
-    byObjectId: null
+    byObjectId: null,
+    segmentIndex: null,
+    nodeIndex: null,
+    terminalNodes: [],
+    trueTerminalNodes: [],
+    downstreamNodes: [],
+    nodeSpatialIndex: null,
+    undirectedNodeAdj: null,
+    reachableEntryNodeKeys: null,
+    pipeCanReachTerminal: null,
+    nextHopToTerminal: null,
+    pipeDistToTerminalM: null,
+    terminalPipeSet: null
   });
 
   // Device start location (from browser geolocation)
   const [deviceLoc, setDeviceLoc] = useState({
-    ready: false,
-    lat: FALLBACK_CENTER.lat,
-    lng: FALLBACK_CENTER.lng
+    ready: !!parsedStoredLoc,
+    lat: parsedStoredLoc?.lat ?? FALLBACK_CENTER.lat,
+    lng: parsedStoredLoc?.lng ?? FALLBACK_CENTER.lng
   });
 
   const [showStreetRoutes, setShowStreetRoutes] = useState(true);
   const [showPipePlans, setShowPipePlans] = useState(true);
   const [speed10x, setSpeed10x] = useState(false);
+  const [perfMode, setPerfMode] = useState(PERF_MODE_DEFAULT);
+  const isMobileViewport = useMemo(
+    () => (typeof window !== "undefined" ? window.matchMedia("(max-width: 900px)").matches : false),
+    []
+  );
+  const [showLabels, setShowLabels] = useState(!isMobileViewport);
+  const [showPipeGlow, setShowPipeGlow] = useState(SHOW_PIPE_GLOW_DEFAULT);
+  const [showEndpoints, setShowEndpoints] = useState(true);
+  const [showFallbackBridges, setShowFallbackBridges] = useState(true);
+  const [routingFallbackMode, setRoutingFallbackMode] = useState(ROUTING_FALLBACK_DEFAULT);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   // People points
   // mode: "street" | "pipe" | "arrived" | "error"
-  const [points, setPoints] = useState([]);
+  const [renderPoints, setRenderPoints] = useState([]);
+  const pointsRef = useRef([]);
+  const restoredOnceRef = useRef(false);
+  const lastSyncedStatusRef = useRef(new Map());
+  const lastServerUpdateRef = useRef(new Map());
+  const initialViewportSetRef = useRef(false);
+  const [mapReady, setMapReady] = useState(false);
 
   // Keep map instance so we can recenter once geolocation arrives
   const mapRef = useRef(null);
+
+  const mutatePoints = useCallback((updater, sync = true) => {
+    const next = updater(pointsRef.current);
+    pointsRef.current = next;
+    if (sync) setRenderPoints(next);
+    return next;
+  }, []);
+
+  useEffect(() => {
+    if (!isSettingsOpen) return;
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") setIsSettingsOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isSettingsOpen]);
 
   // 1) Load pipes GeoJSON from /public + compute velocities + direction + connectivity
   useEffect(() => {
@@ -788,7 +1597,9 @@ export default function App() {
 
     async function load() {
       try {
-        const res = await fetch("/Sewerage_Network_Main_Pipelines.geojson");
+        const startedAt = performance.now();
+        perfLog("load start", { path: PIPE_GEOJSON_PATH });
+        const res = await fetch(PIPE_GEOJSON_PATH);
         if (!res.ok) throw new Error(`GeoJSON fetch failed: ${res.status}`);
         const gj = await res.json();
 
@@ -928,11 +1739,200 @@ export default function App() {
           ft.properties = props;
         }
 
+        const allPipeIds = Array.from(byObjectId.keys());
+        const nextByPipe = new Map();
+        const reverseByPipe = new Map();
+        const undirectedNodeAdj = new Map();
+        const pushAdj = (fromKey, edge) => {
+          const arr = undirectedNodeAdj.get(fromKey);
+          if (arr) arr.push(edge);
+          else undirectedNodeAdj.set(fromKey, [edge]);
+        };
+        for (const id of allPipeIds) reverseByPipe.set(id, []);
+        for (const id of allPipeIds) {
+          const ft = byObjectId.get(id);
+          const next = Array.isArray(ft?.properties?._nextObjectIds) ? ft.properties._nextObjectIds.slice() : [];
+          nextByPipe.set(id, next);
+          for (const n of next) {
+            if (!reverseByPipe.has(n)) reverseByPipe.set(n, []);
+            reverseByPipe.get(n).push(id);
+          }
+
+          const p = ft?.properties || {};
+          const upKey = p._upNodeKey;
+          const downKey = p._downNodeKey;
+          const ord = orderedCoordsForPipe(ft);
+          const meters = routeDistanceMeters(ord);
+          if (upKey && downKey && ord.length > 1) {
+            const rev = ord.slice().reverse();
+            pushAdj(upKey, { toKey: downKey, objectId: id, meters, coords: ord });
+            pushAdj(downKey, { toKey: upKey, objectId: id, meters, coords: rev });
+          }
+        }
+
+
+        const terminalNodes = [];
+        const downstreamNodes = [];
+        for (const node of nodeIndex.values()) {
+          const outCount = Array.isArray(node.outObjectIds) ? node.outObjectIds.length : 0;
+          const inCount = Array.isArray(node.inObjectIds) ? node.inObjectIds.length : 0;
+          const row = {
+            key: node.key,
+            lat: node.lat,
+            lng: node.lng,
+            inCount,
+            outCount,
+            inObjectIds: (node.inObjectIds || []).slice(),
+            outObjectIds: (node.outObjectIds || []).slice()
+          };
+          if (outCount > 0) downstreamNodes.push(row);
+          if (outCount === 0 && inCount > 0) terminalNodes.push(row);
+        }
+        const terminalNodeKeys = new Set(terminalNodes.map((n) => n.key));
+        const terminalPipeSet = new Set();
+        for (const [id, ft] of byObjectId.entries()) {
+          const downKey = ft?.properties?._downNodeKey;
+          if (downKey && terminalNodeKeys.has(downKey)) terminalPipeSet.add(id);
+        }
+
+        // Reduce sink endpoints to the 3 primary processing destinations by trunk-level reach.
+        const terminalReachByPipe = new Map();
+        for (const tid of terminalPipeSet) {
+          const seen = new Set([tid]);
+          const q = [tid];
+          while (q.length > 0) {
+            const curr = q.shift();
+            const parents = reverseByPipe.get(curr) || [];
+            for (const p of parents) {
+              if (seen.has(p)) continue;
+              seen.add(p);
+              q.push(p);
+            }
+          }
+          terminalReachByPipe.set(tid, seen.size);
+        }
+
+        const trunkBest = new Map();
+        for (const tid of terminalPipeSet) {
+          const ft = byObjectId.get(tid);
+          const props = ft?.properties || {};
+          const downKey = props._downNodeKey;
+          if (!downKey) continue;
+          const trunk = normaliseSewerName(props.SEWER_NAME || props.SEWERNAME || "UNKNOWN");
+          const reach = terminalReachByPipe.get(tid) || 0;
+          const prev = trunkBest.get(trunk);
+          if (!prev || reach > prev.reach) trunkBest.set(trunk, { trunk, tid, downKey, reach });
+        }
+        const selected = [];
+        for (const name of TRUE_ENDPOINT_NAME_PRIORITY) {
+          const hit = trunkBest.get(name);
+          if (hit) selected.push(hit);
+        }
+        if (selected.length < 3) {
+          const used = new Set(selected.map((x) => x.trunk));
+          const extras = Array.from(trunkBest.values())
+            .filter((x) => !used.has(x.trunk))
+            .sort((a, b) => b.reach - a.reach)
+            .slice(0, 3 - selected.length);
+          selected.push(...extras);
+        }
+        const trueTerminalNodeKeys = new Set(selected.slice(0, 3).map((x) => x.downKey));
+        const trueTerminalNodes = terminalNodes.filter((n) => trueTerminalNodeKeys.has(n.key));
+        const trueTerminalPipeSet = new Set();
+        for (const [id, ft] of byObjectId.entries()) {
+          const downKey = ft?.properties?._downNodeKey;
+          if (downKey && trueTerminalNodeKeys.has(downKey)) trueTerminalPipeSet.add(id);
+        }
+
+        const pipeCanReachTerminal = new Set(trueTerminalPipeSet);
+        const queue = Array.from(trueTerminalPipeSet);
+        const distToTerminal = new Map();
+        for (const id of trueTerminalPipeSet) distToTerminal.set(id, 0);
+        while (queue.length > 0) {
+          const curr = queue.shift();
+          const parents = reverseByPipe.get(curr) || [];
+          for (const p of parents) {
+            if (pipeCanReachTerminal.has(p)) continue;
+            pipeCanReachTerminal.add(p);
+            distToTerminal.set(p, (distToTerminal.get(curr) || 0) + 1);
+            queue.push(p);
+          }
+        }
+
+        const nextHopToTerminal = new Map();
+        for (const id of allPipeIds) {
+          const next = nextByPipe.get(id) || [];
+          const reachableNext = next.filter((n) => pipeCanReachTerminal.has(n));
+          if (reachableNext.length === 0) {
+            nextHopToTerminal.set(id, null);
+            continue;
+          }
+          let best = reachableNext[0];
+          let bestDist = distToTerminal.get(best) ?? Number.MAX_SAFE_INTEGER;
+          for (let i = 1; i < reachableNext.length; i++) {
+            const cand = reachableNext[i];
+            const d = distToTerminal.get(cand) ?? Number.MAX_SAFE_INTEGER;
+            if (d < bestDist) {
+              bestDist = d;
+              best = cand;
+            }
+          }
+          nextHopToTerminal.set(id, best);
+        }
+
+        const pipeLengthById = new Map();
+        for (const id of allPipeIds) {
+          const ft = byObjectId.get(id);
+          pipeLengthById.set(id, routeDistanceMeters(orderedCoordsForPipe(ft)));
+        }
+        const pipeDistToTerminalM = new Map();
+        const dfsDist = (id, stack = new Set()) => {
+          if (pipeDistToTerminalM.has(id)) return pipeDistToTerminalM.get(id);
+          if (!pipeCanReachTerminal.has(id)) return Infinity;
+          if (stack.has(id)) return Infinity;
+          stack.add(id);
+          const own = pipeLengthById.get(id) || 0;
+          const nxt = nextHopToTerminal.get(id);
+          let total = own;
+          if (nxt !== null && nxt !== undefined) {
+            const dNext = dfsDist(nxt, stack);
+            total = Number.isFinite(dNext) ? own + dNext : own;
+          }
+          stack.delete(id);
+          pipeDistToTerminalM.set(id, total);
+          return total;
+        };
+        for (const id of allPipeIds) dfsDist(id);
+
+        const reachableEntryNodeKeys = new Set();
+        for (const [key, n] of nodeIndex.entries()) {
+          const out = Array.isArray(n.outObjectIds) ? n.outObjectIds : [];
+          if (out.some((oid) => pipeCanReachTerminal.has(oid))) reachableEntryNodeKeys.add(key);
+        }
 
         const bbox =
           isFinite(minLat) && isFinite(minLng) && isFinite(maxLat) && isFinite(maxLng)
             ? { minLat, minLng, maxLat, maxLng }
             : null;
+        const segmentIndex = buildSegmentSpatialIndex(features);
+        const nodeSpatialIndex = buildNodeSpatialIndex(downstreamNodes);
+        perfLog("load done", {
+          path: PIPE_GEOJSON_PATH,
+          features: features.length,
+          cells: segmentIndex.cells.size,
+          terminalNodes: terminalNodes.length,
+          trueTerminalNodes: trueTerminalNodes.length,
+          trueTerminals: selected.slice(0, 3).map((x) => ({ name: x.trunk, reach: x.reach })),
+          reachablePipes: pipeCanReachTerminal.size,
+          avgToTerminalM:
+            pipeCanReachTerminal.size > 0
+              ? Math.round(
+                  Array.from(pipeCanReachTerminal).reduce((acc, id) => acc + (pipeDistToTerminalM.get(id) || 0), 0) /
+                    pipeCanReachTerminal.size
+                )
+              : 0,
+          ms: Math.round(performance.now() - startedAt)
+        });
 
         if (cancelled) return;
 
@@ -942,7 +1942,19 @@ export default function App() {
           bbox,
           count: features.length,
           nodeCount: nodeIndex.size,
-          byObjectId
+          byObjectId,
+          segmentIndex,
+          nodeIndex,
+          terminalNodes,
+          trueTerminalNodes,
+          downstreamNodes,
+          nodeSpatialIndex,
+          undirectedNodeAdj,
+          reachableEntryNodeKeys,
+          pipeCanReachTerminal,
+          nextHopToTerminal,
+          pipeDistToTerminalM,
+          terminalPipeSet: trueTerminalPipeSet
         });
       } catch (e) {
         if (cancelled) return;
@@ -953,7 +1965,19 @@ export default function App() {
           bbox: null,
           count: 0,
           nodeCount: 0,
-          byObjectId: null
+          byObjectId: null,
+          segmentIndex: null,
+          nodeIndex: null,
+          terminalNodes: [],
+          trueTerminalNodes: [],
+          downstreamNodes: [],
+          nodeSpatialIndex: null,
+          undirectedNodeAdj: null,
+          reachableEntryNodeKeys: null,
+          pipeCanReachTerminal: null,
+          nextHopToTerminal: null,
+          pipeDistToTerminalM: null,
+          terminalPipeSet: null
         });
       }
     }
@@ -978,9 +2002,16 @@ export default function App() {
           lat,
           lng
         });
+        try {
+          window.localStorage.setItem("flush:lastDeviceLoc", JSON.stringify({ lat, lng }));
+        } catch {
+          // ignore storage errors
+        }
 
-        const map = mapRef.current;
-        if (map) map.setView([lat, lng], 14);
+        if (mapRef.current && !initialViewportSetRef.current) {
+          mapRef.current.setView([lat, lng], 14);
+          initialViewportSetRef.current = true;
+        }
       },
       () => {
         // Keep fallback centre
@@ -993,12 +2024,367 @@ export default function App() {
     );
   }, []);
 
+  useEffect(() => {
+    if (initialViewportSetRef.current) return;
+    if (!mapReady || !mapRef.current) return;
+
+    const coords = [];
+    for (const p of renderPoints) {
+      if (typeof p.lat === "number" && typeof p.lng === "number") coords.push({ lat: p.lat, lng: p.lng });
+      if (Array.isArray(p.street?.route)) coords.push(...p.street.route);
+      if (Array.isArray(p.pipePlan)) coords.push(...p.pipePlan);
+      if (Array.isArray(p.fallbackBridge?.path)) coords.push(...p.fallbackBridge.path);
+    }
+
+    const map = mapRef.current;
+    if (coords.length >= 2) {
+      let minLat = Infinity;
+      let minLng = Infinity;
+      let maxLat = -Infinity;
+      let maxLng = -Infinity;
+      for (const c of coords) {
+        if (typeof c.lat !== "number" || typeof c.lng !== "number") continue;
+        if (c.lat < minLat) minLat = c.lat;
+        if (c.lat > maxLat) maxLat = c.lat;
+        if (c.lng < minLng) minLng = c.lng;
+        if (c.lng > maxLng) maxLng = c.lng;
+      }
+      if (isFinite(minLat) && isFinite(minLng) && isFinite(maxLat) && isFinite(maxLng)) {
+        map.fitBounds(
+          [
+            [minLat, minLng],
+            [maxLat, maxLng]
+          ],
+          { padding: [30, 30], maxZoom: 14 }
+        );
+        initialViewportSetRef.current = true;
+        return;
+      }
+    }
+
+    if (coords.length === 1) {
+      map.setView([coords[0].lat, coords[0].lng], 14);
+      initialViewportSetRef.current = true;
+      return;
+    }
+
+    if (deviceLoc.ready) {
+      map.setView([deviceLoc.lat, deviceLoc.lng], 14);
+      initialViewportSetRef.current = true;
+    }
+  }, [mapReady, renderPoints, deviceLoc.ready, deviceLoc.lat, deviceLoc.lng]);
+
+  const buildPointFromPersistedRun = useCallback((run, nowMs) => {
+    const startedAtMs = Date.parse(run.started_at || run.startedAt || run.created_at || new Date().toISOString());
+    const elapsedSec = Math.max(0, (nowMs - startedAtMs) / 1000);
+    const streetRoute = Array.isArray(run.street_route) ? run.street_route : [];
+    const pipePlan = Array.isArray(run.pipe_plan) ? run.pipe_plan : [];
+    const streetSpeed = Number(run.street_speed_mps || STREET_SPEED_MPS);
+    const pipeSpeed = Number(run.pipe_base_speed_mps || PIPE_SPEED_MIN_MPS);
+    const streetTotal = Number.isFinite(run.street_total_m) ? run.street_total_m : routeDistanceMeters(streetRoute);
+    const pipeTotal = Number.isFinite(run.pipe_total_m) ? run.pipe_total_m : routeDistanceMeters(pipePlan);
+    const streetEta = streetSpeed > 0 ? streetTotal / streetSpeed : 0;
+    const pipeEta = pipeSpeed > 0 ? pipeTotal / pipeSpeed : 0;
+    const routingStatus = run.routing_status || "incomplete";
+    const startedLabel = new Date(startedAtMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    const base = {
+      id: run.id,
+      name: run.user_name || "User",
+      street: null,
+      contact: run.contact || null,
+      pipe: null,
+      pipePlan,
+      error: run.error_message || null,
+      routingStatus,
+      fallbackUsed: !!run.fallback_bridge,
+      fallbackReason: run.fallback_reason || "none",
+      fallbackBridge: run.fallback_bridge || null,
+      terminalNode: run.terminal_node || null,
+      currentVelocityBaseMps: null,
+      currentVelocitySimMps: null,
+      etaToDestinationSec: null,
+      persistedStatus: run.status || "active",
+      serverUpdatedAtMs: Date.parse(run.updated_at || run.started_at || new Date().toISOString()),
+      initiatedAtIso: run.started_at || null,
+      initiatedAtLabel: startedLabel
+    };
+
+    if (run.status === "error") {
+      return { ...base, mode: "error", lat: run.current_lat ?? run.origin_lat, lng: run.current_lng ?? run.origin_lng };
+    }
+
+    const totalEta = streetEta + pipeEta;
+    if (elapsedSec >= totalEta) {
+      const endPt = pipePlan[pipePlan.length - 1] || streetRoute[streetRoute.length - 1] || { lat: run.origin_lat, lng: run.origin_lng };
+      return {
+        ...base,
+        mode: "arrived",
+        lat: endPt.lat,
+        lng: endPt.lng,
+        currentVelocityBaseMps: 0,
+        currentVelocitySimMps: 0,
+        etaToDestinationSec: 0,
+        persistedStatus: "arrived",
+        serverUpdatedAtMs: Date.parse(run.updated_at || new Date().toISOString())
+      };
+    }
+
+    if (elapsedSec < streetEta && streetRoute.length > 1) {
+      const traveled = elapsedSec * streetSpeed;
+      const at = locateAlongPath(streetRoute, traveled);
+      const streetRemaining = Math.max(0, streetTotal - traveled);
+      return {
+        ...base,
+        mode: "street",
+        lat: at.point?.lat ?? run.origin_lat,
+        lng: at.point?.lng ?? run.origin_lng,
+        street: {
+          route: streetRoute,
+          idx: at.nextIdx,
+          speedMps: streetSpeed,
+          distM: streetTotal,
+          etaS: streetEta,
+          visible: true
+        },
+        currentVelocityBaseMps: streetSpeed,
+        currentVelocitySimMps: streetSpeed,
+        etaToDestinationSec: streetRemaining / streetSpeed + pipeEta,
+        serverUpdatedAtMs: Date.parse(run.updated_at || new Date().toISOString())
+      };
+    }
+
+    const pipeElapsed = Math.max(0, elapsedSec - streetEta);
+    const pipeTraveled = pipeElapsed * pipeSpeed;
+    const at = locateAlongPath(pipePlan, pipeTraveled);
+    const pipeRemaining = Math.max(0, pipeTotal - pipeTraveled);
+    return {
+      ...base,
+      mode: "pipe",
+      lat: at.point?.lat ?? run.origin_lat,
+      lng: at.point?.lng ?? run.origin_lng,
+      street: streetRoute.length > 1 ? { route: streetRoute, idx: streetRoute.length, speedMps: streetSpeed, distM: streetTotal, etaS: streetEta, visible: false } : null,
+      pipe: { objectId: run.contact?.pipeObjectId ?? null, idx: at.nextIdx, speedMps: pipeSpeed, segmentVelocityMps: pipeSpeed },
+      currentVelocityBaseMps: pipeSpeed,
+      currentVelocitySimMps: pipeSpeed,
+      etaToDestinationSec: pipeSpeed > 0 ? pipeRemaining / pipeSpeed : null,
+      serverUpdatedAtMs: Date.parse(run.updated_at || new Date().toISOString())
+    };
+  }, []);
+
+  const buildPipeRouteResult = useCallback((objectId, contactPoint) => {
+    if (!pipeData.byObjectId || !pipeData.nodeIndex || objectId === null || !contactPoint) {
+      return {
+        coords: [],
+        routingStatus: "incomplete",
+        fallbackUsed: false,
+        fallbackReason: "missing_feature",
+        fallbackBridge: null,
+        terminalNode: null
+      };
+    }
+
+    const strict = buildPipePlanFromObjectId(
+      objectId,
+      contactPoint,
+      pipeData.byObjectId,
+      pipeData.nodeIndex,
+      2000,
+      null,
+      pipeData.pipeCanReachTerminal,
+      routingFallbackMode === "guarantee_endpoint" ? pipeData.nextHopToTerminal : null
+    );
+
+    if (strict.endReason === "terminal") {
+      return {
+        coords: strict.coords,
+        routingStatus: "strict_arrived",
+        fallbackUsed: false,
+        fallbackReason: "none",
+        fallbackBridge: null,
+        terminalNode: strict.terminalNode
+      };
+    }
+
+    const toFallbackReason = (endReason) => {
+      if (endReason === "loop") return "loop_detected";
+      if (endReason === "max_hops") return "max_hops_reached";
+      if (endReason === "unreachable_subgraph") return "unreachable_subgraph";
+      return "no_next_edge";
+    };
+
+    if (routingFallbackMode === "strict") {
+      return {
+        coords: strict.coords,
+        routingStatus: "incomplete",
+        fallbackUsed: false,
+        fallbackReason: toFallbackReason(strict.endReason),
+        fallbackBridge: null,
+        terminalNode: null
+      };
+    }
+
+    const bridgeFrom = strict.lastPoint || contactPoint;
+    const connector =
+      routingFallbackMode === "guarantee_endpoint"
+        ? findBestPurpleConnectorPath({
+            fromPoint: bridgeFrom,
+            fromNodeKey: strict.lastNodeKey,
+            nodeAdj: pipeData.undirectedNodeAdj,
+            reachableEntryNodeKeys: pipeData.reachableEntryNodeKeys,
+            nodeIndex: pipeData.nodeIndex,
+            pipeCanReachTerminal: pipeData.pipeCanReachTerminal,
+            pipeDistToTerminalM: pipeData.pipeDistToTerminalM
+          })
+        : null;
+
+    let resumeStartId = null;
+    let entryPoint = bridgeFrom;
+
+    if (routingFallbackMode === "guarantee_endpoint") {
+      if (!connector || !connector.resumeStartPipeId) {
+        return {
+          coords: strict.coords,
+          routingStatus: "incomplete",
+          fallbackUsed: false,
+          fallbackReason: "no_connector_path",
+          fallbackBridge: null,
+          terminalNode: null
+        };
+      }
+      resumeStartId = connector.resumeStartPipeId;
+      entryPoint = connector.entryPoint || bridgeFrom;
+    } else {
+      const nearest = findNearestDownstreamNode(
+        bridgeFrom,
+        pipeData.nodeSpatialIndex,
+        FALLBACK_MAX_BRIDGE_M,
+        new Set(strict.lastNodeKey ? [strict.lastNodeKey] : [])
+      );
+      if (!nearest || !nearest.node || !Array.isArray(nearest.node.outObjectIds) || nearest.node.outObjectIds.length === 0) {
+        return {
+          coords: strict.coords,
+          routingStatus: "incomplete",
+          fallbackUsed: false,
+          fallbackReason: toFallbackReason(strict.endReason),
+          fallbackBridge: null,
+          terminalNode: null
+        };
+      }
+      const lastFt = strict.lastObjectId !== null && strict.lastObjectId !== undefined ? pipeData.byObjectId.get(strict.lastObjectId) : null;
+      const outIdsRaw = nearest.node.outObjectIds.slice();
+      const outIds = outIdsRaw;
+      if (outIds.length === 0) {
+        return {
+          coords: strict.coords,
+          routingStatus: "incomplete",
+          fallbackUsed: false,
+          fallbackReason: "unreachable_subgraph",
+          fallbackBridge: null,
+          terminalNode: null
+        };
+      }
+      resumeStartId =
+        outIds.length === 1
+          ? outIds[0]
+          : chooseNextPipeLowestDownIL(outIds, pipeData.byObjectId, lastFt?.properties || {});
+      entryPoint = { lat: nearest.node.lat, lng: nearest.node.lng };
+    }
+
+    if (resumeStartId === null || resumeStartId === undefined) {
+      return {
+        coords: strict.coords,
+        routingStatus: "incomplete",
+        fallbackUsed: false,
+        fallbackReason: "no_next_edge",
+        fallbackBridge: null,
+        terminalNode: null
+      };
+    }
+
+    const resumeFt = pipeData.byObjectId.get(resumeStartId);
+    const resumeOrd = orderedCoordsForPipe(resumeFt);
+    const bridgeContact = nearestPointOnOrderedPipe(resumeOrd, entryPoint);
+    const resumeStartPoint = bridgeContact?.point || entryPoint;
+    const resumed = buildPipePlanFromObjectId(
+      resumeStartId,
+      resumeStartPoint,
+      pipeData.byObjectId,
+      pipeData.nodeIndex,
+      2000,
+      strict.visitedObjectIds,
+      routingFallbackMode === "guarantee_endpoint" ? pipeData.pipeCanReachTerminal : null,
+      routingFallbackMode === "guarantee_endpoint" ? pipeData.nextHopToTerminal : null
+    );
+
+    const merged = strict.coords.slice();
+    const bridgePath = [bridgeFrom];
+    if (routingFallbackMode === "guarantee_endpoint" && Array.isArray(connector?.connectorPathCoords)) {
+      for (const pt of connector.connectorPathCoords) {
+        const last = bridgePath[bridgePath.length - 1];
+        if (last && metersBetween(last, pt) < 0.2) continue;
+        bridgePath.push(pt);
+      }
+    } else {
+      const last = bridgePath[bridgePath.length - 1];
+      if (!last || metersBetween(last, entryPoint) > 0.2) bridgePath.push(entryPoint);
+    }
+    {
+      const last = bridgePath[bridgePath.length - 1];
+      if (!last || metersBetween(last, resumeStartPoint) > 0.2) bridgePath.push(resumeStartPoint);
+    }
+    for (const pt of bridgePath) {
+      const last = merged[merged.length - 1];
+      if (last && metersBetween(last, pt) < 0.2) continue;
+      merged.push(pt);
+    }
+    if (Array.isArray(resumed.coords) && resumed.coords.length > 0) {
+      for (let i = 1; i < resumed.coords.length; i++) merged.push(resumed.coords[i]);
+    }
+
+    const bridge = {
+      from: bridgeFrom,
+      to: resumeStartPoint,
+      meters: routeDistanceMeters(bridgePath),
+      mode: routingFallbackMode,
+      reason: toFallbackReason(strict.endReason),
+      path: bridgePath
+    };
+
+    return {
+      coords: merged,
+      routingStatus:
+        resumed.endReason === "terminal"
+          ? routingFallbackMode === "guarantee_endpoint"
+            ? "guaranteed_arrived"
+            : "fallback_arrived"
+          : "incomplete",
+      fallbackUsed: true,
+      fallbackReason: resumed.endReason === "terminal" ? "none" : toFallbackReason(resumed.endReason),
+      fallbackBridge: bridge,
+      terminalNode: resumed.terminalNode || null
+    };
+  }, [
+    pipeData.byObjectId,
+    pipeData.nodeIndex,
+    pipeData.nodeSpatialIndex,
+    pipeData.undirectedNodeAdj,
+    pipeData.reachableEntryNodeKeys,
+    pipeData.pipeCanReachTerminal,
+    pipeData.nextHopToTerminal,
+    pipeData.pipeDistToTerminalM,
+    routingFallbackMode
+  ]);
+
   async function buildStreetRouteForPoint(pointId, startLL) {
     if (!pipeData.geojson) return;
 
-    const contact = findNearestPipeContact(pipeData.geojson, startLL);
+    const t0 = performance.now();
+    const features = Array.isArray(pipeData.geojson?.features) ? pipeData.geojson.features : [];
+    const contact =
+      findNearestPipeContactWithIndex(features, pipeData.segmentIndex, startLL) ||
+      findNearestPipeContact(pipeData.geojson, startLL);
     if (!contact || !contact.point) {
-      setPoints((prev) =>
+      mutatePoints((prev) =>
         prev.map((pt) => (pt.id === pointId ? { ...pt, mode: "error", error: "No pipes found" } : pt))
       );
       return;
@@ -1006,18 +2392,39 @@ export default function App() {
 
     const props = contact.feature?.properties || {};
     const objectId = toNum(props.OBJECTID);
+    const contactPipeV = clamp(toNum(props._v_half_mps) || PIPE_SPEED_MIN_MPS, PIPE_SPEED_MIN_MPS, PIPE_SPEED_MAX_MPS);
 
     try {
       const route = await fetchOsrmRoute(startLL, contact.point);
       const distM = routeDistanceMeters(route);
       const etaS = STREET_SPEED_MPS > 0 ? distM / STREET_SPEED_MPS : 0;
-	  
-	  const pipePlan =
-	    pipeData.byObjectId && objectId !== null
-		  ? buildPipePlanFromObjectId(objectId, contact.point, pipeData.byObjectId)
-		  : null;
-	  
-      setPoints((prev) =>
+
+      const pipeRoute = objectId !== null ? buildPipeRouteResult(objectId, contact.point) : null;
+      let persisted = null;
+      try {
+        persisted = await apiFetch("/api/flushes", {
+          method: "POST",
+          body: JSON.stringify({
+            id: pointId,
+            userName: pointsRef.current.find((p) => p.id === pointId)?.name || `Flush-${pointId}`,
+            origin: startLL,
+            startedAt: pointsRef.current.find((p) => p.id === pointId)?.initiatedAtIso || new Date().toISOString(),
+            streetRoute: route,
+            streetSpeedMps: STREET_SPEED_MPS,
+            pipePlan: pipeRoute?.coords || [],
+            pipeBaseSpeedMps: contactPipeV,
+            routingStatus: pipeRoute?.routingStatus || "incomplete",
+            fallbackReason: pipeRoute?.fallbackReason || "none",
+            fallbackBridge: pipeRoute?.fallbackBridge || null,
+            terminalNode: pipeRoute?.terminalNode || null,
+            contact: { point: contact.point, pipeObjectId: objectId, pipeVelocityMps: contactPipeV }
+          })
+        });
+      } catch (persistErr) {
+        console.warn("flush persistence failed", persistErr);
+      }
+
+      mutatePoints((prev) =>
         prev.map((pt) =>
           pt.id === pointId
             ? {
@@ -1033,17 +2440,29 @@ export default function App() {
                 },
                 contact: {
                   point: contact.point,
-                  pipeObjectId: objectId
+                  pipeObjectId: objectId,
+                  pipeVelocityMps: contactPipeV
                 },
                 pipe: null,
-                pipePlan
+                pipePlan: pipeRoute?.coords || null,
+                routingStatus: pipeRoute?.routingStatus || "incomplete",
+                fallbackUsed: !!pipeRoute?.fallbackUsed,
+                fallbackReason: pipeRoute?.fallbackReason || "no_next_edge",
+                fallbackBridge: pipeRoute?.fallbackBridge || null,
+                terminalNode: pipeRoute?.terminalNode || null,
+                persistedStatus: persisted?.status || "active"
               }
             : pt
         )
       );
+      perfLog("flush route ready", {
+        pointId,
+        ms: Math.round(performance.now() - t0),
+        routeMeters: Math.round(distM)
+      });
     } catch (e) {
       console.error(e);
-      setPoints((prev) =>
+      mutatePoints((prev) =>
         prev.map((pt) =>
           pt.id === pointId ? { ...pt, mode: "error", error: String(e?.message || e) } : pt
         )
@@ -1051,52 +2470,22 @@ export default function App() {
     }
   }
 
-  function enterPipeMode(pointId) {
-    setPoints((prev) =>
-      prev.map((pt) => {
-        if (pt.id !== pointId) return pt;
-
-        const contactPoint = pt.contact?.point;
-        const objectId = pt.contact?.pipeObjectId;
-
-        if (!pipeData.byObjectId || objectId === null || !contactPoint) {
-          return { ...pt, mode: "error", error: "Pipe network not ready" };
-        }
-
-        const ft = pipeData.byObjectId.get(objectId);
-        const props = ft?.properties || {};
-
-        const vRaw = toNum(props._v_half_mps) || 0;
-        const v = clamp(vRaw, PIPE_SPEED_MIN_MPS, PIPE_SPEED_MAX_MPS);
-
-        const plan = buildPipePlanFromObjectId(objectId, contactPoint, pipeData.byObjectId);
-
-        return {
-          ...pt,
-          mode: "pipe",
-          street: pt.street ? { ...pt.street, visible: false } : pt.street,
-          pipe: {
-            objectId,
-            idx: 1,
-            speedMps: v,
-            segmentVelocityMps: v
-          },
-          pipePlan: plan
-        };
-      })
-    );
-  }
-
   // 3) Add a dot and immediately create its street route to nearest pipe
   function addPointAt(lat, lng, name) {
-    const id = Date.now() + Math.random();
+    const id = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random());
+    const initiatedAtIso = new Date().toISOString();
+    const initiatedAtLabel = new Date(initiatedAtIso).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit"
+    });
 
     flushCounterRef.current += 1;
     const finalName = name && String(name).trim().length ? name : `Test ${flushCounterRef.current}`;
 
     setFlushes((n) => n + 1);
 
-    setPoints((p) => [
+    mutatePoints((p) => [
       ...p,
       {
         id,
@@ -1108,7 +2497,18 @@ export default function App() {
         contact: null,
         pipe: null,
         pipePlan: null,
-        error: null
+        error: null,
+        routingStatus: null,
+        fallbackUsed: false,
+        fallbackReason: "none",
+        fallbackBridge: null,
+        terminalNode: null,
+        currentVelocityBaseMps: null,
+        currentVelocitySimMps: null,
+        etaToDestinationSec: null,
+        persistedStatus: "active",
+        initiatedAtIso,
+        initiatedAtLabel
       }
     ]);
 
@@ -1145,7 +2545,7 @@ export default function App() {
   useEffect(() => {
     if (!pipeData.geojson) return;
 
-    const unrouted = points.filter((p) => p.mode === "street" && !p.street && !p.error);
+    const unrouted = pointsRef.current.filter((p) => p.mode === "street" && !p.street && !p.error);
     if (unrouted.length === 0) return;
 
     for (const p of unrouted) {
@@ -1153,161 +2553,385 @@ export default function App() {
     }
   }, [pipeData.geojson]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  useEffect(() => {
+    if (!pipeData.ready || restoredOnceRef.current) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const nowResp = await apiFetch("/api/time");
+        const runs = await apiFetch("/api/flushes?status=active");
+        if (cancelled) return;
+        const nowMs = Date.parse(nowResp?.now || new Date().toISOString());
+        const restored = (Array.isArray(runs) ? runs : [])
+          .map((r) => buildPointFromPersistedRun(r, nowMs))
+          .filter(Boolean);
+        restored.forEach((p) => {
+          if (p?.id && Number.isFinite(p.serverUpdatedAtMs)) lastServerUpdateRef.current.set(p.id, p.serverUpdatedAtMs);
+        });
+        pointsRef.current = restored;
+        setRenderPoints(restored);
+        restoredOnceRef.current = true;
+      } catch (e) {
+        if (cancelled) return;
+        console.warn("rehydrate failed", e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [pipeData.ready, buildPointFromPersistedRun]);
+
+  useEffect(() => {
+    if (!pipeData.ready) return;
+    const es = new EventSource(`${API_BASE_URL}/api/events`);
+
+    es.addEventListener("flush_created", (evt) => {
+      try {
+        const run = JSON.parse(evt.data);
+        const nowMs = Date.now();
+        const point = buildPointFromPersistedRun(run, nowMs);
+        if (!point?.id) return;
+        const newTs = Date.parse(run.updated_at || run.started_at || new Date().toISOString());
+        const oldTs = lastServerUpdateRef.current.get(point.id) ?? -Infinity;
+        if (newTs < oldTs) return;
+        lastServerUpdateRef.current.set(point.id, newTs);
+        mutatePoints((prev) => {
+          const idx = prev.findIndex((p) => p.id === point.id);
+          if (idx === -1) return [...prev, point];
+          const next = prev.slice();
+          next[idx] = { ...next[idx], ...point };
+          return next;
+        });
+      } catch (e) {
+        console.warn("flush_created parse failed", e);
+      }
+    });
+
+    es.addEventListener("flush_status_updated", (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        const id = msg?.id;
+        if (!id) return;
+        const newTs = Date.parse(msg.updated_at || new Date().toISOString());
+        const oldTs = lastServerUpdateRef.current.get(id) ?? -Infinity;
+        if (newTs < oldTs) return;
+        lastServerUpdateRef.current.set(id, newTs);
+        mutatePoints((prev) =>
+          prev.map((p) => {
+            if (p.id !== id) return p;
+            if (msg.status === "arrived") {
+              return {
+                ...p,
+                persistedStatus: "arrived",
+                mode: "arrived",
+                etaToDestinationSec: 0,
+                currentVelocityBaseMps: 0,
+                currentVelocitySimMps: 0
+              };
+            }
+            if (msg.status === "error") {
+              return {
+                ...p,
+                persistedStatus: "error",
+                mode: "error",
+                error: msg.error_message || p.error || "server_error"
+              };
+            }
+            return { ...p, persistedStatus: "active" };
+          })
+        );
+      } catch (e) {
+        console.warn("flush_status_updated parse failed", e);
+      }
+    });
+
+    es.onerror = () => {
+      // EventSource retries automatically; no-op.
+    };
+
+    return () => {
+      es.close();
+    };
+  }, [pipeData.ready, buildPointFromPersistedRun, mutatePoints]);
+
+  useEffect(() => {
+    const terminalish = renderPoints.filter(
+      (p) => p?.id && p.persistedStatus === "active" && (p.mode === "arrived" || p.mode === "error")
+    );
+    if (terminalish.length === 0) return;
+    terminalish.forEach((p) => {
+      const targetStatus = p.mode === "arrived" ? "arrived" : "error";
+      const already = lastSyncedStatusRef.current.get(p.id);
+      if (already === targetStatus) return;
+      lastSyncedStatusRef.current.set(p.id, targetStatus);
+      apiFetch(`/api/flushes/${encodeURIComponent(p.id)}/status`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          status: targetStatus,
+          errorMessage: p.mode === "error" ? p.error || "simulation_error" : null
+        })
+      }).catch((e) => {
+        console.warn("status sync failed", e);
+      });
+    });
+  }, [renderPoints]);
+
   // 4) Animate dots: street mode then pipe mode
   useEffect(() => {
-    const TICK_MS = 80;
-    const timer = setInterval(() => {
-      setPoints((prev) =>
-        prev.map((pt) => {
-          if (pt.mode === "error" || pt.mode === "arrived") return pt;
+    let rafId = 0;
+    let lastTs = 0;
+    let lastUiSyncTs = 0;
+    let lastPerfLogTs = 0;
 
-          // Street movement
-          if (pt.mode === "street" && pt.street && Array.isArray(pt.street.route)) {
-            const route = pt.street.route;
-            const idx = pt.street.idx || 1;
-            const target = route[idx];
+    const frameStep = (ts) => {
+      if (!lastTs) lastTs = ts;
+      const dtMs = ts - lastTs;
+      const targetFps = perfMode === "mobile" ? ANIMATION_FPS_TARGET : 60;
+      const targetFrameMs = 1000 / targetFps;
+      if (dtMs < targetFrameMs) {
+        rafId = requestAnimationFrame(frameStep);
+        return;
+      }
+      lastTs = ts;
+      const cappedDtMs = Math.min(100, dtMs);
+      const speedMult = speed10x ? 10 : 1;
+      const withTelemetry = (obj, base, sim, eta) => ({
+        ...obj,
+        currentVelocityBaseMps: Number.isFinite(base) ? base : null,
+        currentVelocitySimMps: Number.isFinite(sim) ? sim : null,
+        etaToDestinationSec: Number.isFinite(eta) ? Math.max(0, eta) : null
+      });
 
-            if (!target) {
-              // Arrived at contact point; switch to pipe mode
-              return pt;
+      let changed = false;
+      const frameStart = performance.now();
+
+      const nextPoints = pointsRef.current.map((pt) => {
+        if (pt.mode === "error") return withTelemetry(pt, null, null, null);
+        if (pt.mode === "arrived") return withTelemetry(pt, 0, 0, 0);
+
+        if (pt.mode === "street" && pt.street && Array.isArray(pt.street.route)) {
+          const route = pt.street.route;
+          const idx = pt.street.idx || 1;
+          const target = route[idx];
+          if (!target) return pt;
+
+          const here = { lat: pt.lat, lng: pt.lng };
+          const stepMeters = pt.street.speedMps * speedMult * (cappedDtMs / 1000);
+          const dist = metersBetween(here, target);
+
+          if (dist <= stepMeters) {
+            const nextIdx = idx + 1;
+            const atEnd = nextIdx >= route.length;
+            const moved = {
+              ...pt,
+              lat: target.lat,
+              lng: target.lng,
+              street: { ...pt.street, idx: nextIdx }
+            };
+
+            changed = true;
+            if (!atEnd) return moved;
+
+            const objectId = moved.contact?.pipeObjectId;
+            if (!pipeData.byObjectId || objectId === null || !Array.isArray(moved.pipePlan) || moved.pipePlan.length < 2) {
+              return withTelemetry({ ...moved, mode: "error", error: "Pipe network not ready" }, null, null, null);
             }
 
-            const here = { lat: pt.lat, lng: pt.lng };
-            const speedMult = speed10x ? 10 : 1;
-            const stepMeters = (pt.street.speedMps * speedMult * TICK_MS) / 1000;
-            const dist = metersBetween(here, target);
+            const ft = pipeData.byObjectId.get(objectId);
+            const props = ft?.properties || {};
+            const vRaw = toNum(props._v_half_mps) || 0;
+            const v = clamp(vRaw, PIPE_SPEED_MIN_MPS, PIPE_SPEED_MAX_MPS);
+            const simV = v * speedMult;
+            const here2 = { lat: moved.lat, lng: moved.lng };
+            const eta = v > 0 ? remainingDistanceOnPath(moved.pipePlan, 1, here2) / v : null;
 
-            if (dist <= stepMeters) {
-              const nextIdx = idx + 1;
-              const atEnd = nextIdx >= route.length;
-
-              const moved = {
-                ...pt,
-                lat: target.lat,
-                lng: target.lng,
-                street: { ...pt.street, idx: nextIdx }
-              };
-
-              if (atEnd) {
-                // We reached the final street route point (contact); enter pipe mode next tick
-                setTimeout(() => enterPipeMode(pt.id), 0);
-              }
-
-              return moved;
-            }
-
-            const f = stepMeters / dist;
-            const lat = pt.lat + (target.lat - pt.lat) * f;
-            const lng = pt.lng + (target.lng - pt.lng) * f;
-
-            return { ...pt, lat, lng };
+            return withTelemetry({
+              ...moved,
+              mode: "pipe",
+              street: moved.street ? { ...moved.street, visible: false } : moved.street,
+              pipe: { objectId, idx: 1, speedMps: v, segmentVelocityMps: v },
+              pipePlan: moved.pipePlan
+            }, v, simV, eta);
           }
 
-          // Pipe movement
-          if (pt.mode === "pipe" && pt.pipePlan && Array.isArray(pt.pipePlan)) {
-            const plan = pt.pipePlan;
-            const idx = pt.pipe?.idx || 1;
-            const target = plan[idx];
+          const f = stepMeters / dist;
+          changed = true;
+          const nextStreet = {
+            ...pt,
+            lat: pt.lat + (target.lat - pt.lat) * f,
+            lng: pt.lng + (target.lng - pt.lng) * f
+          };
+          const baseV = pt.street.speedMps;
+          const simV = baseV * speedMult;
+          const remainingStreetM = remainingDistanceOnPath(route, idx, { lat: nextStreet.lat, lng: nextStreet.lng });
+          const remainingPipeM = Array.isArray(pt.pipePlan) ? routeDistanceMeters(pt.pipePlan) : 0;
+          const pipeBaseV = toNum(pt.pipe?.speedMps) || (toNum(pt.contact?.pipeVelocityMps) || PIPE_SPEED_MIN_MPS);
+          const streetEta = baseV > 0 ? remainingStreetM / baseV : null;
+          const pipeEta = pipeBaseV > 0 ? remainingPipeM / pipeBaseV : null;
+          const eta = streetEta !== null && pipeEta !== null ? streetEta + pipeEta : streetEta ?? pipeEta;
+          return withTelemetry(nextStreet, baseV, simV, eta);
+        }
 
-            if (!target) {
-              return { ...pt, mode: "arrived" };
+        if (pt.mode === "pipe" && pt.pipePlan && Array.isArray(pt.pipePlan)) {
+          const plan = pt.pipePlan;
+          const idx = pt.pipe?.idx || 1;
+          const target = plan[idx];
+          if (!target) {
+            if (pt.routingStatus === "incomplete") {
+              return withTelemetry({ ...pt, mode: "error", error: "Incomplete route to endpoint" }, null, null, null);
             }
-
-            const here = { lat: pt.lat, lng: pt.lng };
-
-            // Determine speed for current pipe feature (updates at junctions by re-reading properties)
-            let speed = pt.pipe?.speedMps || 0.6;
-
-            // If we can identify current feature by objectId and update speed from it:
-            const objectId = pt.pipe?.objectId;
-            if (pipeData.byObjectId && objectId !== null && objectId !== undefined) {
-              const ft = pipeData.byObjectId.get(objectId);
-              const props = ft?.properties || {};
-              const vRaw = toNum(props._v_half_mps) || speed;
-              speed = clamp(vRaw, PIPE_SPEED_MIN_MPS, PIPE_SPEED_MAX_MPS);
-            }
-
-            const speedMult = speed10x ? 10 : 1;
-            const stepMeters = (speed * speedMult * TICK_MS) / 1000;
-            const dist = metersBetween(here, target);
-
-            if (dist <= stepMeters) {
-              const nextIdx = idx + 1;
-              const atEnd = nextIdx >= plan.length;
-
-              return {
-                ...pt,
-                lat: target.lat,
-                lng: target.lng,
-                pipe: { ...pt.pipe, idx: nextIdx, speedMps: speed },
-                mode: atEnd ? "arrived" : "pipe"
-              };
-            }
-
-            const f = stepMeters / dist;
-            const lat = pt.lat + (target.lat - pt.lat) * f;
-            const lng = pt.lng + (target.lng - pt.lng) * f;
-
-            return { ...pt, lat, lng, pipe: { ...pt.pipe, speedMps: speed } };
+            return withTelemetry({ ...pt, mode: "arrived" }, 0, 0, 0);
           }
 
-          return pt;
-        })
-      );
-    }, TICK_MS);
+          let speed = pt.pipe?.speedMps || 0.6;
+          const objectId = pt.pipe?.objectId;
+          if (pipeData.byObjectId && objectId !== null && objectId !== undefined) {
+            const ft = pipeData.byObjectId.get(objectId);
+            const props = ft?.properties || {};
+            const vRaw = toNum(props._v_half_mps) || speed;
+            speed = clamp(vRaw, PIPE_SPEED_MIN_MPS, PIPE_SPEED_MAX_MPS);
+          }
 
-    return () => clearInterval(timer);
-  }, [pipeData.byObjectId, speed10x]);
+          const here = { lat: pt.lat, lng: pt.lng };
+          const stepMeters = speed * speedMult * (cappedDtMs / 1000);
+          const dist = metersBetween(here, target);
+
+          if (dist <= stepMeters) {
+            const nextIdx = idx + 1;
+            const atEnd = nextIdx >= plan.length;
+            changed = true;
+            const nextPipe = {
+              ...pt,
+              lat: target.lat,
+              lng: target.lng,
+              pipe: { ...pt.pipe, idx: nextIdx, speedMps: speed },
+              mode: atEnd ? "arrived" : "pipe"
+            };
+            if (atEnd) return withTelemetry(nextPipe, 0, 0, 0);
+            const simV = speed * speedMult;
+            const eta = speed > 0 ? remainingDistanceOnPath(plan, nextIdx, { lat: nextPipe.lat, lng: nextPipe.lng }) / speed : null;
+            return withTelemetry(nextPipe, speed, simV, eta);
+          }
+
+          const f = stepMeters / dist;
+          changed = true;
+          const movingPipe = {
+            ...pt,
+            lat: pt.lat + (target.lat - pt.lat) * f,
+            lng: pt.lng + (target.lng - pt.lng) * f,
+            pipe: { ...pt.pipe, speedMps: speed }
+          };
+          const simV = speed * speedMult;
+          const eta = speed > 0 ? remainingDistanceOnPath(plan, idx, { lat: movingPipe.lat, lng: movingPipe.lng }) / speed : null;
+          return withTelemetry(movingPipe, speed, simV, eta);
+        }
+
+        return withTelemetry(pt, null, null, null);
+      });
+
+      pointsRef.current = nextPoints;
+
+      const uiSyncPeriodMs = 1000 / UI_SYNC_FPS;
+      if (changed && ts - lastUiSyncTs >= uiSyncPeriodMs) {
+        lastUiSyncTs = ts;
+        setRenderPoints(nextPoints);
+      }
+
+      if (ts - lastPerfLogTs >= 2000) {
+        lastPerfLogTs = ts;
+        perfLog("animation tick", {
+          points: nextPoints.length,
+          frameMs: Math.round(performance.now() - frameStart),
+          targetFps
+        });
+      }
+
+      rafId = requestAnimationFrame(frameStep);
+    };
+
+    rafId = requestAnimationFrame(frameStep);
+    return () => cancelAnimationFrame(rafId);
+  }, [perfMode, pipeData.byObjectId, speed10x]);
 
   const pipeStats = useMemo(() => {
     if (!pipeData.ready) return "Pipes: loading…";
     return `Pipes: ${pipeData.count.toLocaleString()} | Nodes: ${pipeData.nodeCount.toLocaleString()}`;
   }, [pipeData.ready, pipeData.count, pipeData.nodeCount]);
+  const trackedByUser = useMemo(() => {
+    const counts = Object.fromEntries(users.map((u) => [u, 0]));
+    for (const p of renderPoints) {
+      if (!(p.name in counts)) continue;
+      if (p.mode === "arrived" || p.mode === "error") continue;
+      counts[p.name] += 1;
+    }
+    return counts;
+  }, [renderPoints]);
 
-  const lastFew = useMemo(() => points.slice(-5), [points]);
+  const recenterToDevice = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (deviceLoc.ready) {
+      map.setView([deviceLoc.lat, deviceLoc.lng], 14);
+      return;
+    }
+    if (!("geolocation" in navigator)) return;
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        setDeviceLoc({ ready: true, lat, lng });
+        try {
+          window.localStorage.setItem("flush:lastDeviceLoc", JSON.stringify({ lat, lng }));
+        } catch {
+          // ignore storage errors
+        }
+        map.setView([lat, lng], 14);
+      },
+      () => {}
+    );
+  }, [deviceLoc.ready, deviceLoc.lat, deviceLoc.lng]);
 
   return (
     <div className="layout">
       <div className="sidebar">
-        <div className="counter">Flushes: {flushes}</div>
-        <div className="counterSub">{pipeStats}</div>
+        <div className="sidebarTop">
+          <div className="counterSub">Updated: {APP_LAST_UPDATED}</div>
+          <div className="counter">Flushes: {flushes}</div>
+          <div className="counterSub">{pipeStats}</div>
 
-        <button onClick={() => setShowStreetRoutes((v) => !v)}>
-          {showStreetRoutes ? "Hide street routes" : "Show street routes"}
-        </button>
+          {users.map((u) => (
+            <button key={u} onClick={() => addPoint(u)}>
+              {u} ({trackedByUser[u] || 0} tracking)
+            </button>
+          ))}
+        </div>
 
-        <button onClick={() => setShowPipePlans((v) => !v)}>
-          {showPipePlans ? "Hide pipe plan" : "Show pipe plan"}
-        </button>
-
-        <button onClick={() => setSpeed10x((v) => !v)}>
-          {speed10x ? "Speed: 10×" : "Speed: 1×"}
-        </button>
-
-<button onClick={() => setSpeed10x((v) => !v)}>
-          {speed10x ? "Speed: 10×" : "Speed: 1×"}
-        </button>
-
-        <button onClick={() => setClickToFlush((v) => !v)}>
-          {clickToFlush ? "Click-to-flush: ON" : "Click-to-flush: OFF"}
-        </button>
-
-        {users.map((u) => (
-          <button key={u} onClick={() => addPoint(u)}>
-            {u}
+        <div className="sidebarBottom">
+          <div className="sidebarSectionTitle">Simulation</div>
+          <button onClick={() => setSpeed10x((v) => !v)}>
+            {speed10x ? "Speed: 10x" : "Speed: 1x"}
           </button>
-        ))}
-
-        <pre>{JSON.stringify(lastFew, null, 2)}</pre>
+          <button onClick={() => setClickToFlush((v) => !v)}>
+            {clickToFlush ? "Click-to-flush: ON" : "Click-to-flush: OFF"}
+          </button>
+        </div>
       </div>
 
       <div className="map">
+        <button className="settingsFab" onClick={() => setIsSettingsOpen(true)} aria-label="Open settings">
+          Settings
+        </button>
+        <button className="recenterFab" onClick={recenterToDevice} aria-label="Recenter to my location">
+          My location
+        </button>
         <MapContainer
           center={[FALLBACK_CENTER.lat, FALLBACK_CENTER.lng]}
           zoom={13}
+          preferCanvas
           style={{ height: "100%", width: "100%" }}
           whenCreated={(map) => {
             mapRef.current = map;
+            setMapReady(true);
           }}
         >
           <TileLayer
@@ -1316,147 +2940,42 @@ export default function App() {
           />
           <ClickToAddFlush />
 
-          {pipeData.geojson && (
-            <GeoJSON
-              data={pipeData.geojson}
-              style={() => ({
-                color: "#ff00ff",
-                weight: 4,
-                opacity: 0.95,
-                className: "pipe-glow"
-              })}
-              onEachFeature={(feature, layer) => {
-                const p = feature?.properties || {};
-                const v = toNum(p._v_half_mps);
-                const vTxt = v !== null ? `${v.toFixed(2)} m/s` : "—";
-                const next = Array.isArray(p._nextObjectIds) ? p._nextObjectIds.slice(0, 10).join(", ") : "—";
-
-                layer.bindPopup(
-                  `<div style="font-family: sans-serif; font-size: 12px;">
-                    <div><b>OBJECTID:</b> ${p.OBJECTID ?? "—"}</div>
-                    <div><b>SEWER_NAME:</b> ${p.SEWER_NAME ?? "—"}</div>
-                    <div><b>Material:</b> ${p.MATERIAL ?? "—"} <span style="opacity:0.7">(n=${p._manning_n ?? "—"})</span></div>
-                    <div><b>Size (W/H mm):</b> ${p.PIPE_WIDTH ?? "—"} / ${p.PIPE_HEIGHT ?? "—"}</div>
-                    <div><b>Pipe length:</b> ${p.PIPE_LENGTH ?? "—"}</div>
-                    <div><b>Slope (GRADE):</b> ${p.GRADE ?? "—"}</div>
-                    <div><b>Up IL / Down IL:</b> ${p.UPSTREAM_IL ?? "—"} / ${p.DOWNSTREAM_IL ?? "—"}</div>
-                    <div><b>Velocity (half-full):</b> ${vTxt}</div>
-                  </div>`
-                );
-              }}
-            />
-          )}
-
-          {showStreetRoutes &&
-            points
-              .filter((p) => p.street?.visible && Array.isArray(p.street.route) && p.street.route.length > 1)
-              .map((p) => (
-                <Polyline
-                  key={`street-${p.id}`}
-                  positions={p.street.route.map((pt) => [pt.lat, pt.lng])}
-                  pathOptions={{
-                    color: "#8b5a2b",
-                    weight: 4,
-                    opacity: 0.8
-                  }}
-                >
-                  <Popup>
-                    <div>
-                      <div>
-                        <b>{p.name}</b> street route
-                      </div>
-                      <div>Distance: {Math.round(p.street.distM || 0)} m</div>
-                      <div>Speed: {p.street.speedMps?.toFixed(2)} m/s</div>
-                      <div>ETA: {Math.round(p.street.etaS || 0)} s</div>
-                      <div>
-                        Destination pipe OBJECTID:{" "}
-                        {p.contact?.pipeObjectId !== null && p.contact?.pipeObjectId !== undefined
-                          ? p.contact.pipeObjectId
-                          : "—"}
-                      </div>
-                    </div>
-                  </Popup>
-                </Polyline>
-              ))}
-
-          {showPipePlans &&
-            points
-              .filter((p) => Array.isArray(p.pipePlan) && p.pipePlan.length > 1)
-              .map((p) => (
-                <Polyline
-                  key={`pipeplan-${p.id}`}
-                  positions={p.pipePlan.map((pt) => [pt.lat, pt.lng])}
-                  pathOptions={{
-                    color: "#00aa00",
-                    weight: 5,
-                    opacity: 0.85
-                  }}
-                >
-                  <Popup>
-                    {(() => {
-                      const startId = p.contact?.pipeObjectId ?? null;
-                      const startFt = startId !== null && pipeData.byObjectId ? pipeData.byObjectId.get(startId) : null;
-                      const sp = startFt?.properties || {};
-
-                      const v = typeof sp._v_half_mps === "number" ? sp._v_half_mps : parseFloat(sp._v_half_mps);
-                      const vTxt = Number.isFinite(v) ? `${v.toFixed(2)} m/s` : "—";
-                      const next = Array.isArray(sp._nextObjectIds) ? sp._nextObjectIds.slice(0, 10).join(", ") : "—";
-
-                      return (
-                        <div style={{ fontFamily: "sans-serif", fontSize: 12 }}>
-                          <div><b>OBJECTID:</b> {sp.OBJECTID ?? "—"}</div>
-                          <div><b>SEWER_NAME:</b> {sp.SEWER_NAME ?? "—"}</div>
-                          <div><b>Material:</b> {sp.MATERIAL ?? "—"} <span style={{ opacity: 0.7 }}>(n={sp._manning_n ?? "—"})</span></div>
-                          <div><b>Size (W/H mm):</b> {sp.PIPE_WIDTH ?? "—"} / {sp.PIPE_HEIGHT ?? "—"}</div>
-                          <div><b>Pipe length:</b> {sp.PIPE_LENGTH ?? "—"}</div>
-                          <div><b>Slope (GRADE):</b> {sp.GRADE ?? "—"}</div>
-                          <div><b>Up IL / Down IL:</b> {sp.UPSTREAM_IL ?? "—"} / {sp.DOWNSTREAM_IL ?? "—"}</div>
-                          <div><b>Velocity (half-full):</b> {vTxt}</div>
-						  <div><b>Virtual next:</b> ${p._virtual_next_mode ?? "—"} ${p._virtual_next_dist_m ? `(${Number(p._virtual_next_dist_m).toFixed(1)} m)` : ""} ${p._virtual_next_radius_m ? `r=${p._virtual_next_radius_m} m` : ""}</div>
-				          <div><b>Virtual next dist:</b> ${p._virtual_next_dist_m ?? "—"} m</div>
-
-
-
-                        </div>
-                      );
-                    })()}
-                  </Popup>
-
-                </Polyline>
-              ))}
-
-
-          {points.map((p) => (
-            <CircleMarker
-              key={p.id}
-              center={[p.lat, p.lng]}
-              radius={7}
-              pathOptions={{
-                color: "#6b1b1b",
-                fillColor: "#6b1b1b",
-                fillOpacity: 0.95,
-                weight: 2
-              }}
-            >
-              <Popup>
-                <div>
-                  <div>
-                    <b>{p.name}</b>
-                  </div>
-                  <div>Mode: {p.mode}</div>
-                  {p.mode === "pipe" && p.pipe?.speedMps !== undefined && (
-                    <div>Pipe speed: {p.pipe.speedMps.toFixed(2)} m/s</div>
-                  )}
-                  {p.error && <div>{p.error}</div>}
-                </div>
-              </Popup>
-
-              <Tooltip permanent direction="right" offset={[10, 0]} opacity={0.9}>
-                {p.name}
-              </Tooltip>
-            </CircleMarker>
-          ))}
+          <PipeGeoJsonLayer
+            geojson={pipeData.geojson}
+            showPipeGlow={perfMode === "desktop" && showPipeGlow}
+            perfMode={perfMode}
+          />
+          <EndpointsLayer terminalNodes={pipeData.trueTerminalNodes} showEndpoints={showEndpoints} />
+          <StreetRoutesLayer points={renderPoints} showStreetRoutes={showStreetRoutes} />
+          <PipePlansLayer points={renderPoints} showPipePlans={showPipePlans} byObjectId={pipeData.byObjectId} />
+          <FallbackBridgeLayer points={renderPoints} showFallbackBridges={showFallbackBridges} />
+          <MovingPointsLayer points={renderPoints} showLabels={showLabels} isMobileViewport={isMobileViewport} />
         </MapContainer>
+
+        <SettingsModal
+          isOpen={isSettingsOpen}
+          onClose={() => setIsSettingsOpen(false)}
+          perfMode={perfMode}
+          setPerfMode={setPerfMode}
+          showLabels={showLabels}
+          setShowLabels={setShowLabels}
+          showPipeGlow={showPipeGlow}
+          setShowPipeGlow={setShowPipeGlow}
+          showEndpoints={showEndpoints}
+          setShowEndpoints={setShowEndpoints}
+          showFallbackBridges={showFallbackBridges}
+          setShowFallbackBridges={setShowFallbackBridges}
+          routingFallbackMode={routingFallbackMode}
+          setRoutingFallbackMode={setRoutingFallbackMode}
+          showStreetRoutes={showStreetRoutes}
+          setShowStreetRoutes={setShowStreetRoutes}
+          showPipePlans={showPipePlans}
+          setShowPipePlans={setShowPipePlans}
+          speed10x={speed10x}
+          setSpeed10x={setSpeed10x}
+          clickToFlush={clickToFlush}
+          setClickToFlush={setClickToFlush}
+        />
       </div>
     </div>
   );
