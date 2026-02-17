@@ -2,6 +2,9 @@
 
 Live sewer-route flush simulator with persistent state and cross-browser realtime updates.
 
+> [!WARNING]
+> No authentication is implemented. This stack is for local/dev use only and must not be exposed publicly without adding auth and hardening.
+
 ## Current State
 
 This repo now has two apps:
@@ -20,6 +23,7 @@ This repo now has two apps:
 - Persists flush runs in `server/data/flushes.db`.
 - Rehydrates active flushes on frontend startup.
 - Pushes live delta events via SSE (`/api/events`) so multiple browser windows stay in sync.
+- Uses localhost-only CORS allowlist by default (configurable via env vars).
 
 ## Key Features
 
@@ -92,16 +96,34 @@ VITE_API_BASE_URL=http://localhost:8787 npm run dev
 Base URL: `http://localhost:8787`
 
 - `GET /api/time`
-- `GET /api/flushes?status=active`
+- `GET /api/flushes?status=active&limit=200&offset=0`
+- `GET /api/flushes?status=active&updated_after=<ISO8601>`
 - `POST /api/flushes`
 - `PATCH /api/flushes/:id/status`
 - `GET /api/events` (SSE stream)
+
+## Server Env Vars
+
+- `PORT` (default `8787`)
+- `FLUSH_DB_PATH` (default `./data/flushes.db`)
+- `RETENTION_DAYS` (default `30`)
+- `RETENTION_SWEEP_MINUTES` (default `15`)
+- `CORS_ORIGINS` (comma-separated allowlist, optional)
+- `ALLOW_ALL_CORS=true` (dev/debug only; overrides allowlist)
 
 ## Data Notes
 
 - SQLite file: `server/data/flushes.db`
 - Route payloads and metadata are stored in `flush_runs` JSON fields.
 - Frontend rehydrates persisted active runs once on startup, then consumes SSE deltas.
+- Terminal runs are purged in retention sweeps after policy age (default 30 days).
+
+## Deployment Checklist (Required Before Internet Exposure)
+
+1. Add authentication/authorization for write endpoints and SSE.
+2. Set explicit `CORS_ORIGINS` for trusted origins only.
+3. Run behind TLS and a reverse proxy.
+4. Keep `ALLOW_ALL_CORS` disabled.
 
 ## Dev Checks
 

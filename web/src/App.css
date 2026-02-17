@@ -43,6 +43,14 @@
   margin-bottom: 12px;
 }
 
+.inlineRetryBtn {
+  width: auto !important;
+  margin: 0 0 0 6px !important;
+  padding: 2px 8px !important;
+  font-size: 11px !important;
+  border-radius: 4px !important;
+}
+
 .sidebar button {
   width: 100%;
   border: 0;

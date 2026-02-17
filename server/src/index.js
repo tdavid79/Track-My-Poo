@@ -1,12 +1,32 @@
+import { randomUUID } from "crypto";
 import express from "express";
 import cors from "cors";
 import Database from "better-sqlite3";
 
 const PORT = Number(process.env.PORT || 8787);
 const DB_PATH = process.env.FLUSH_DB_PATH || "./data/flushes.db";
+const RETENTION_DAYS = Math.max(1, Number(process.env.RETENTION_DAYS || 30));
+const RETENTION_SWEEP_MINUTES = Math.max(1, Number(process.env.RETENTION_SWEEP_MINUTES || 15));
+const ALLOW_ALL_CORS = String(process.env.ALLOW_ALL_CORS || "").toLowerCase() === "true";
+const DEFAULT_CORS_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"];
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const ALLOWED_ORIGINS = new Set(CORS_ORIGINS.length > 0 ? CORS_ORIGINS : DEFAULT_CORS_ORIGINS);
 
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (ALLOW_ALL_CORS || !origin || ALLOWED_ORIGINS.has(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error("Not allowed by CORS"));
+    }
+  })
+);
 app.use(express.json({ limit: "2mb" }));
 const sseClients = new Set();
 
@@ -38,6 +58,8 @@ CREATE TABLE IF NOT EXISTS flush_runs (
   error_message TEXT,
   updated_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_flush_runs_status_started_at ON flush_runs(status, started_at);
+CREATE INDEX IF NOT EXISTS idx_flush_runs_updated_at ON flush_runs(updated_at);
 `);
 
 function metersBetween(a, b) {
@@ -58,32 +80,99 @@ function routeDistanceMeters(route) {
   return d;
 }
 
+function safeJsonParse(raw, fallback, { runId, field, critical = false }) {
+  if (raw === null || raw === undefined || raw === "") return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    console.warn("json_parse_failed", {
+      runId,
+      field,
+      critical,
+      error: String(error?.message || error)
+    });
+    return fallback;
+  }
+}
+
 function parseRunRow(row) {
+  const streetRoute = safeJsonParse(row.street_route_json, [], {
+    runId: row.id,
+    field: "street_route_json",
+    critical: true
+  });
+  const pipePlan = safeJsonParse(row.pipe_plan_json, [], {
+    runId: row.id,
+    field: "pipe_plan_json",
+    critical: true
+  });
+  const fallbackBridge = safeJsonParse(row.fallback_bridge_json, null, {
+    runId: row.id,
+    field: "fallback_bridge_json",
+    critical: false
+  });
+  const terminalNode = safeJsonParse(row.terminal_node_json, null, {
+    runId: row.id,
+    field: "terminal_node_json",
+    critical: false
+  });
+  const contact = safeJsonParse(row.contact_json, null, {
+    runId: row.id,
+    field: "contact_json",
+    critical: false
+  });
+
+  const criticalInvalid =
+    !Array.isArray(streetRoute) ||
+    !Array.isArray(pipePlan) ||
+    streetRoute.some((p) => typeof p?.lat !== "number" || typeof p?.lng !== "number") ||
+    pipePlan.some((p) => typeof p?.lat !== "number" || typeof p?.lng !== "number");
+
   return {
-    id: row.id,
-    user_name: row.user_name,
-    origin_lat: row.origin_lat,
-    origin_lng: row.origin_lng,
-    created_at: row.created_at,
-    started_at: row.started_at,
-    status: row.status,
-    route_version: row.route_version,
-    street_route: JSON.parse(row.street_route_json || "[]"),
-    street_speed_mps: row.street_speed_mps,
-    street_total_m: row.street_total_m,
-    street_eta_s: row.street_eta_s,
-    pipe_plan: JSON.parse(row.pipe_plan_json || "[]"),
-    pipe_base_speed_mps: row.pipe_base_speed_mps,
-    pipe_total_m: row.pipe_total_m,
-    pipe_eta_s: row.pipe_eta_s,
-    routing_status: row.routing_status,
-    fallback_reason: row.fallback_reason,
-    fallback_bridge: row.fallback_bridge_json ? JSON.parse(row.fallback_bridge_json) : null,
-    terminal_node: row.terminal_node_json ? JSON.parse(row.terminal_node_json) : null,
-    contact: row.contact_json ? JSON.parse(row.contact_json) : null,
-    error_message: row.error_message,
-    updated_at: row.updated_at
+    run: {
+      id: row.id,
+      user_name: row.user_name,
+      origin_lat: row.origin_lat,
+      origin_lng: row.origin_lng,
+      created_at: row.created_at,
+      started_at: row.started_at,
+      status: row.status,
+      route_version: row.route_version,
+      street_route: streetRoute,
+      street_speed_mps: row.street_speed_mps,
+      street_total_m: row.street_total_m,
+      street_eta_s: row.street_eta_s,
+      pipe_plan: pipePlan,
+      pipe_base_speed_mps: row.pipe_base_speed_mps,
+      pipe_total_m: row.pipe_total_m,
+      pipe_eta_s: row.pipe_eta_s,
+      routing_status: row.routing_status,
+      fallback_reason: row.fallback_reason,
+      fallback_bridge: fallbackBridge,
+      terminal_node: terminalNode,
+      contact,
+      error_message: row.error_message,
+      updated_at: row.updated_at
+    },
+    criticalInvalid
   };
+}
+
+function normalizeRunRow(row) {
+  const parsed = parseRunRow(row);
+  if (parsed.criticalInvalid && row.status !== "error") {
+    const now = new Date().toISOString();
+    db.prepare("UPDATE flush_runs SET status = ?, error_message = ?, updated_at = ? WHERE id = ?").run(
+      "error",
+      "invalid_route_data",
+      now,
+      row.id
+    );
+    parsed.run.status = "error";
+    parsed.run.error_message = "invalid_route_data";
+    parsed.run.updated_at = now;
+  }
+  return parsed.run;
 }
 
 function broadcastSse(eventName, payload) {
@@ -116,16 +205,40 @@ app.get("/api/events", (req, res) => {
 
 app.get("/api/flushes", (req, res) => {
   const status = req.query.status ? String(req.query.status) : null;
-  const rows = status
-    ? db.prepare("SELECT * FROM flush_runs WHERE status = ? ORDER BY started_at ASC").all(status)
-    : db.prepare("SELECT * FROM flush_runs ORDER BY started_at ASC").all();
-  res.json(rows.map(parseRunRow));
+  const updatedAfter = req.query.updated_after ? String(req.query.updated_after) : null;
+  const limitRaw = Number(req.query.limit ?? 200);
+  const offsetRaw = Number(req.query.offset ?? 0);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(1000, Math.floor(limitRaw))) : 200;
+  const offset = Number.isFinite(offsetRaw) ? Math.max(0, Math.floor(offsetRaw)) : 0;
+
+  const where = [];
+  const params = [];
+  if (status) {
+    where.push("status = ?");
+    params.push(status);
+  }
+  if (updatedAfter) {
+    where.push("updated_at > ?");
+    params.push(updatedAfter);
+  }
+
+  const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+  const sql = `SELECT * FROM flush_runs ${whereClause} ORDER BY started_at ASC LIMIT ? OFFSET ?`;
+  const rows = db.prepare(sql).all(...params, limit, offset);
+  res.json(rows.map(normalizeRunRow));
 });
 
 app.post("/api/flushes", (req, res) => {
   const body = req.body || {};
-  if (!body.id || !body.origin || typeof body.origin.lat !== "number" || typeof body.origin.lng !== "number") {
+  if (!body.origin || typeof body.origin.lat !== "number" || typeof body.origin.lng !== "number") {
     res.status(400).json({ error: "invalid payload" });
+    return;
+  }
+
+  const id = body.id ? String(body.id) : randomUUID();
+  const existing = db.prepare("SELECT id FROM flush_runs WHERE id = ?").get(id);
+  if (existing) {
+    res.status(409).json({ error: "id already exists", id });
     return;
   }
 
@@ -147,30 +260,8 @@ app.post("/api/flushes", (req, res) => {
       pipe_plan_json, pipe_base_speed_mps, pipe_total_m, pipe_eta_s,
       routing_status, fallback_reason, fallback_bridge_json, terminal_node_json, contact_json, error_message, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      user_name = excluded.user_name,
-      origin_lat = excluded.origin_lat,
-      origin_lng = excluded.origin_lng,
-      started_at = excluded.started_at,
-      status = excluded.status,
-      route_version = excluded.route_version,
-      street_route_json = excluded.street_route_json,
-      street_speed_mps = excluded.street_speed_mps,
-      street_total_m = excluded.street_total_m,
-      street_eta_s = excluded.street_eta_s,
-      pipe_plan_json = excluded.pipe_plan_json,
-      pipe_base_speed_mps = excluded.pipe_base_speed_mps,
-      pipe_total_m = excluded.pipe_total_m,
-      pipe_eta_s = excluded.pipe_eta_s,
-      routing_status = excluded.routing_status,
-      fallback_reason = excluded.fallback_reason,
-      fallback_bridge_json = excluded.fallback_bridge_json,
-      terminal_node_json = excluded.terminal_node_json,
-      contact_json = excluded.contact_json,
-      error_message = excluded.error_message,
-      updated_at = excluded.updated_at
   `).run(
-    String(body.id),
+    id,
     String(body.userName || "User"),
     Number(body.origin.lat),
     Number(body.origin.lng),
@@ -195,8 +286,8 @@ app.post("/api/flushes", (req, res) => {
     now
   );
 
-  const row = db.prepare("SELECT * FROM flush_runs WHERE id = ?").get(String(body.id));
-  const parsed = parseRunRow(row);
+  const row = db.prepare("SELECT * FROM flush_runs WHERE id = ?").get(id);
+  const parsed = normalizeRunRow(row);
   broadcastSse("flush_created", parsed);
   res.json(parsed);
 });
@@ -208,6 +299,20 @@ app.patch("/api/flushes/:id/status", (req, res) => {
     res.status(400).json({ error: "invalid payload" });
     return;
   }
+
+  const existing = db.prepare("SELECT * FROM flush_runs WHERE id = ?").get(id);
+  if (!existing) {
+    res.status(404).json({ error: "not found" });
+    return;
+  }
+
+  const alreadyTerminal = existing.status === "arrived" || existing.status === "error";
+  if (alreadyTerminal && existing.status === status) {
+    const parsedExisting = normalizeRunRow(existing);
+    res.json(parsedExisting);
+    return;
+  }
+
   const now = new Date().toISOString();
   db.prepare("UPDATE flush_runs SET status = ?, error_message = ?, updated_at = ? WHERE id = ?").run(
     status,
@@ -215,12 +320,9 @@ app.patch("/api/flushes/:id/status", (req, res) => {
     now,
     id
   );
+
   const row = db.prepare("SELECT * FROM flush_runs WHERE id = ?").get(id);
-  if (!row) {
-    res.status(404).json({ error: "not found" });
-    return;
-  }
-  const parsed = parseRunRow(row);
+  const parsed = normalizeRunRow(row);
   broadcastSse("flush_status_updated", {
     id: parsed.id,
     status: parsed.status,
@@ -229,6 +331,18 @@ app.patch("/api/flushes/:id/status", (req, res) => {
   });
   res.json(parsed);
 });
+
+function runRetentionSweep() {
+  const cutoff = new Date(Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const result = db
+    .prepare("DELETE FROM flush_runs WHERE status IN ('arrived','error') AND updated_at < ?")
+    .run(cutoff);
+  if (import.meta.env?.DEV || process.env.NODE_ENV !== "production") {
+    if ((result?.changes || 0) > 0) {
+      console.log(`[retention] deleted ${result.changes} rows older than ${RETENTION_DAYS}d`);
+    }
+  }
+}
 
 setInterval(() => {
   for (const client of Array.from(sseClients)) {
@@ -240,6 +354,10 @@ setInterval(() => {
   }
 }, 25000);
 
+setInterval(runRetentionSweep, RETENTION_SWEEP_MINUTES * 60 * 1000);
+
 app.listen(PORT, () => {
   console.log(`flush-server listening on :${PORT}`);
+  console.log(`[cors] ${ALLOW_ALL_CORS ? "allow-all" : `allowlist=${Array.from(ALLOWED_ORIGINS).join(",")}`}`);
+  console.log(`[retention] ${RETENTION_DAYS}d every ${RETENTION_SWEEP_MINUTES}m`);
 });

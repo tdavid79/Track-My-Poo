@@ -1,0 +1,30 @@
+# barwon-water-gravity-sewer-pipes.package.json
+CSV	CSV	https://water-barwon.opendata.arcgis.com/api/download/v1/items/b1c3813db02f4d37a6d79d7986dbb59e/csv?layers=4
+ZIP	Shapefile	https://water-barwon.opendata.arcgis.com/api/download/v1/items/b1c3813db02f4d37a6d79d7986dbb59e/shapefile?layers=4
+GeoJSON	GeoJSON	https://water-barwon.opendata.arcgis.com/api/download/v1/items/b1c3813db02f4d37a6d79d7986dbb59e/geojson?layers=4
+ZIP	File Geodatabase	https://water-barwon.opendata.arcgis.com/api/download/v1/items/b1c3813db02f4d37a6d79d7986dbb59e/filegdb?layers=4
+
+# bundaberg-sewerage-network.package.json
+ZIP	BRC2020_Sewerage_Network.zip	https://data.gov.au/data/dataset/556a5b3a-5d4a-4248-8d22-cffbd326685c/resource/913257ec-9327-4e5a-900b-86bdf8e2ddd1/download/brc2020_sewerage_network.zip
+
+# chw-sewermains.package.json
+CSV	CSV	https://central-highlands-water-data-hub-chw.hub.arcgis.com/api/download/v1/items/9f4d0b99ed3b4184bc8a90276a7632aa/csv?layers=0
+ZIP	Shapefile	https://central-highlands-water-data-hub-chw.hub.arcgis.com/api/download/v1/items/9f4d0b99ed3b4184bc8a90276a7632aa/shapefile?layers=0
+GeoJSON	GeoJSON	https://central-highlands-water-data-hub-chw.hub.arcgis.com/api/download/v1/items/9f4d0b99ed3b4184bc8a90276a7632aa/geojson?layers=0
+
+# goldcoast-sewer-pipes-non-pressurised.package.json
+KMZ	Non-Pressurised Sewer Pipes	https://data.gov.au/data/dataset/572986be-105a-46b5-9e5f-96d6ac1ceeda/resource/fecc30e7-487b-4ae7-9149-9e46face4f4b/download/sewerpipenonpressure.kmz
+CSV	Non-Pressurised Sewer Pipes	https://data.gov.au/data/dataset/572986be-105a-46b5-9e5f-96d6ac1ceeda/resource/3ca54619-0323-40c8-b86a-99b0fcc929e3/download/sewerpipenonpressure.csv
+url	Sewer Pipes Non-Pressurised (CoGC Open Data Portal)	https://data-goldcoast.opendata.arcgis.com/datasets/ffa11b9070484df3b5bef5d1e4592a8e_1
+WMS	Sewer Pipes Non-Pressurised - Preview this Dataset (WMS)	https://data.gov.au/geoserver/sewer-pipes-non-pressurised/wms?request=GetCapabilities
+WFS	Sewer Pipes Non-Pressurised Web Feature Service API Link	https://data.gov.au/geoserver/sewer-pipes-non-pressurised/wfs
+GeoJSON	Sewer Pipes Non-Pressurised GeoJSON	https://data.gov.au/geoserver/sewer-pipes-non-pressurised/wfs?request=GetFeature&typeName=ckan_572986be_105a_46b5_9e5f_96d6ac1ceeda&outputFormat=json
+
+# goldcoast-underground-water-assets.package.json
+CSV	Potable Water Pipes 2015	https://data.gov.au/data/dataset/f2a273d6-8f1e-466b-a789-14c487f93745/resource/94720c00-010c-45f9-bc7e-29f7d5cc5ffe/download/waterpipepotable15.csv
+CSV	Recycled Water Pipes 2015	https://data.gov.au/data/dataset/f2a273d6-8f1e-466b-a789-14c487f93745/resource/5a6759ed-ef90-42a8-9ec1-5346e3e4d59f/download/waterpiperecycled15.csv
+KMZ	Sewer Maintenance Holes	https://data.gov.au/data/dataset/f2a273d6-8f1e-466b-a789-14c487f93745/resource/de3c5887-95eb-4021-8de6-a6e609547e9e/download/sewermaintenancehole.kmz
+KMZ	Sewer Connection	https://data.gov.au/data/dataset/f2a273d6-8f1e-466b-a789-14c487f93745/resource/4b364719-57b5-49a9-b487-79cffe6631e2/download/sewerconnection.kmz
+WFS	Underground Water Assets Web Feature Service API Link	https://data.gov.au/geoserver/underground-water-assets/wfs
+GeoJSON	Underground Water Assets GeoJSON	https://data.gov.au/geoserver/underground-water-assets/wfs?request=GetFeature&typeName=ckan_f2a273d6_8f1e_466b_a789_14c487f93745&outputFormat=json
+

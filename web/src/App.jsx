@@ -23,6 +23,8 @@ const TRUE_ENDPOINT_NAME_PRIORITY = [
   "SOUTH EASTERN OUTFALL"
 ];
 const MAX_CONNECTOR_VISITS = 50000;
+const DEBUG_PIPE_HOPS = false;
+const CONNECTOR_WARN_MS = 150;
 const POO_ICON = divIcon({
   className: "poo-marker",
   html: "💩",
@@ -520,6 +522,55 @@ function nearestNodeKeyForPoint(fromPoint, nodeIndex) {
   return bestKey;
 }
 
+class MinHeap {
+  constructor() {
+    this.data = [];
+  }
+
+  push(item) {
+    this.data.push(item);
+    this.#bubbleUp(this.data.length - 1);
+  }
+
+  pop() {
+    if (this.data.length === 0) return null;
+    const top = this.data[0];
+    const end = this.data.pop();
+    if (this.data.length > 0) {
+      this.data[0] = end;
+      this.#sinkDown(0);
+    }
+    return top;
+  }
+
+  get size() {
+    return this.data.length;
+  }
+
+  #bubbleUp(n) {
+    while (n > 0) {
+      const p = Math.floor((n - 1) / 2);
+      if (this.data[p].dist <= this.data[n].dist) break;
+      [this.data[p], this.data[n]] = [this.data[n], this.data[p]];
+      n = p;
+    }
+  }
+
+  #sinkDown(n) {
+    const len = this.data.length;
+    while (true) {
+      const l = 2 * n + 1;
+      const r = l + 1;
+      let smallest = n;
+      if (l < len && this.data[l].dist < this.data[smallest].dist) smallest = l;
+      if (r < len && this.data[r].dist < this.data[smallest].dist) smallest = r;
+      if (smallest === n) break;
+      [this.data[smallest], this.data[n]] = [this.data[n], this.data[smallest]];
+      n = smallest;
+    }
+  }
+}
+
 function findBestPurpleConnectorPath({
   fromPoint,
   fromNodeKey,
@@ -530,28 +581,24 @@ function findBestPurpleConnectorPath({
   pipeDistToTerminalM
 }) {
   if (!fromPoint || !nodeAdj || !reachableEntryNodeKeys || !nodeIndex || !pipeCanReachTerminal || !pipeDistToTerminalM) return null;
+  const t0 = performance.now();
   const startKey = fromNodeKey && nodeIndex.has(fromNodeKey) ? fromNodeKey : nearestNodeKeyForPoint(fromPoint, nodeIndex);
   if (!startKey) return null;
 
   const dist = new Map([[startKey, 0]]);
   const prev = new Map();
-  const unvisited = new Set([startKey]);
+  const heap = new MinHeap();
+  heap.push({ key: startKey, dist: 0 });
   const visited = new Set();
   let visits = 0;
 
-  while (unvisited.size > 0 && visits < MAX_CONNECTOR_VISITS) {
+  while (heap.size > 0 && visits < MAX_CONNECTOR_VISITS) {
     visits += 1;
-    let currKey = null;
-    let currDist = Infinity;
-    for (const k of unvisited) {
-      const d = dist.get(k) ?? Infinity;
-      if (d < currDist) {
-        currDist = d;
-        currKey = k;
-      }
-    }
-    if (currKey === null) break;
-    unvisited.delete(currKey);
+    const next = heap.pop();
+    if (!next) break;
+    const currKey = next.key;
+    const currDist = next.dist;
+    if (currDist > (dist.get(currKey) ?? Infinity)) continue;
     if (visited.has(currKey)) continue;
     visited.add(currKey);
 
@@ -562,7 +609,7 @@ function findBestPurpleConnectorPath({
       if (nd < (dist.get(nextKey) ?? Infinity)) {
         dist.set(nextKey, nd);
         prev.set(nextKey, { fromKey: currKey, edge });
-        if (!visited.has(nextKey)) unvisited.add(nextKey);
+        if (!visited.has(nextKey)) heap.push({ key: nextKey, dist: nd });
       }
     }
   }
@@ -616,6 +663,10 @@ function findBestPurpleConnectorPath({
   }
   const entryNode = nodeIndex.get(best.entryKey);
   const entryPoint = entryNode ? { lat: entryNode.lat, lng: entryNode.lng } : fromPoint;
+  const elapsed = performance.now() - t0;
+  if (import.meta.env.DEV && elapsed > CONNECTOR_WARN_MS) {
+    console.warn("[CONNECTOR] slow solve", { ms: Math.round(elapsed), visits, startKey });
+  }
   return {
     connectorPathCoords,
     connectorMeters: best.connectorMeters,
@@ -1026,7 +1077,7 @@ function buildPipePlanFromObjectId(
     }
     lastNodeKey = p._downNodeKey || null;
 
-    if (visited.size < 120) {
+    if (import.meta.env.DEV && DEBUG_PIPE_HOPS && visited.size < 120) {
       console.log(
         "[PIPEHOP] " +
           currentId +
@@ -1561,6 +1612,7 @@ export default function App() {
   const [showFallbackBridges, setShowFallbackBridges] = useState(true);
   const [routingFallbackMode, setRoutingFallbackMode] = useState(ROUTING_FALLBACK_DEFAULT);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [pendingCreates, setPendingCreates] = useState([]);
 
   // People points
   // mode: "street" | "pipe" | "arrived" | "error"
@@ -1569,6 +1621,8 @@ export default function App() {
   const restoredOnceRef = useRef(false);
   const lastSyncedStatusRef = useRef(new Map());
   const lastServerUpdateRef = useRef(new Map());
+  const reconcileInFlightRef = useRef(false);
+  const lastSseReconcileMsRef = useRef(0);
   const initialViewportSetRef = useRef(false);
   const [mapReady, setMapReady] = useState(false);
 
@@ -2375,146 +2429,99 @@ export default function App() {
     routingFallbackMode
   ]);
 
-  async function buildStreetRouteForPoint(pointId, startLL) {
-    if (!pipeData.geojson) return;
-
+  async function createPersistedFlushFromOrigin({ startLL, name, startedAtIso, requestedId }) {
+    if (!pipeData.geojson) throw new Error("Pipe network not ready");
     const t0 = performance.now();
     const features = Array.isArray(pipeData.geojson?.features) ? pipeData.geojson.features : [];
     const contact =
       findNearestPipeContactWithIndex(features, pipeData.segmentIndex, startLL) ||
       findNearestPipeContact(pipeData.geojson, startLL);
-    if (!contact || !contact.point) {
-      mutatePoints((prev) =>
-        prev.map((pt) => (pt.id === pointId ? { ...pt, mode: "error", error: "No pipes found" } : pt))
-      );
-      return;
-    }
+    if (!contact || !contact.point) throw new Error("No pipes found");
 
     const props = contact.feature?.properties || {};
     const objectId = toNum(props.OBJECTID);
     const contactPipeV = clamp(toNum(props._v_half_mps) || PIPE_SPEED_MIN_MPS, PIPE_SPEED_MIN_MPS, PIPE_SPEED_MAX_MPS);
+    const route = await fetchOsrmRoute(startLL, contact.point);
+    const pipeRoute = objectId !== null ? buildPipeRouteResult(objectId, contact.point) : null;
+    const persisted = await apiFetch("/api/flushes", {
+      method: "POST",
+      body: JSON.stringify({
+        id: requestedId || undefined,
+        userName: name,
+        origin: startLL,
+        startedAt: startedAtIso || new Date().toISOString(),
+        streetRoute: route,
+        streetSpeedMps: STREET_SPEED_MPS,
+        pipePlan: pipeRoute?.coords || [],
+        pipeBaseSpeedMps: contactPipeV,
+        routingStatus: pipeRoute?.routingStatus || "incomplete",
+        fallbackReason: pipeRoute?.fallbackReason || "none",
+        fallbackBridge: pipeRoute?.fallbackBridge || null,
+        terminalNode: pipeRoute?.terminalNode || null,
+        contact: { point: contact.point, pipeObjectId: objectId, pipeVelocityMps: contactPipeV }
+      })
+    });
+    const point = buildPointFromPersistedRun(persisted, Date.now());
+    if (!point) throw new Error("Unable to rehydrate persisted flush");
+    perfLog("flush route ready", {
+      pointId: point.id,
+      ms: Math.round(performance.now() - t0),
+      routeMeters: Math.round(routeDistanceMeters(route))
+    });
+    return point;
+  }
 
+  async function startFlushCreate(pending) {
+    setPendingCreates((prev) =>
+      prev.map((x) => (x.requestId === pending.requestId ? { ...x, isSaving: true, error: null } : x))
+    );
     try {
-      const route = await fetchOsrmRoute(startLL, contact.point);
-      const distM = routeDistanceMeters(route);
-      const etaS = STREET_SPEED_MPS > 0 ? distM / STREET_SPEED_MPS : 0;
-
-      const pipeRoute = objectId !== null ? buildPipeRouteResult(objectId, contact.point) : null;
-      let persisted = null;
-      try {
-        persisted = await apiFetch("/api/flushes", {
-          method: "POST",
-          body: JSON.stringify({
-            id: pointId,
-            userName: pointsRef.current.find((p) => p.id === pointId)?.name || `Flush-${pointId}`,
-            origin: startLL,
-            startedAt: pointsRef.current.find((p) => p.id === pointId)?.initiatedAtIso || new Date().toISOString(),
-            streetRoute: route,
-            streetSpeedMps: STREET_SPEED_MPS,
-            pipePlan: pipeRoute?.coords || [],
-            pipeBaseSpeedMps: contactPipeV,
-            routingStatus: pipeRoute?.routingStatus || "incomplete",
-            fallbackReason: pipeRoute?.fallbackReason || "none",
-            fallbackBridge: pipeRoute?.fallbackBridge || null,
-            terminalNode: pipeRoute?.terminalNode || null,
-            contact: { point: contact.point, pipeObjectId: objectId, pipeVelocityMps: contactPipeV }
-          })
-        });
-      } catch (persistErr) {
-        console.warn("flush persistence failed", persistErr);
-      }
-
-      mutatePoints((prev) =>
-        prev.map((pt) =>
-          pt.id === pointId
-            ? {
-                ...pt,
-                mode: "street",
-                street: {
-                  route,
-                  idx: 1,
-                  speedMps: STREET_SPEED_MPS,
-                  distM,
-                  etaS,
-                  visible: true
-                },
-                contact: {
-                  point: contact.point,
-                  pipeObjectId: objectId,
-                  pipeVelocityMps: contactPipeV
-                },
-                pipe: null,
-                pipePlan: pipeRoute?.coords || null,
-                routingStatus: pipeRoute?.routingStatus || "incomplete",
-                fallbackUsed: !!pipeRoute?.fallbackUsed,
-                fallbackReason: pipeRoute?.fallbackReason || "no_next_edge",
-                fallbackBridge: pipeRoute?.fallbackBridge || null,
-                terminalNode: pipeRoute?.terminalNode || null,
-                persistedStatus: persisted?.status || "active"
-              }
-            : pt
-        )
-      );
-      perfLog("flush route ready", {
-        pointId,
-        ms: Math.round(performance.now() - t0),
-        routeMeters: Math.round(distM)
+      const point = await createPersistedFlushFromOrigin({
+        startLL: pending.origin,
+        name: pending.name,
+        startedAtIso: pending.startedAtIso
       });
+      mutatePoints((prev) => {
+        const idx = prev.findIndex((p) => p.id === point.id);
+        if (idx === -1) return [...prev, point];
+        const next = prev.slice();
+        next[idx] = { ...next[idx], ...point };
+        return next;
+      });
+      setPendingCreates((prev) => prev.filter((x) => x.requestId !== pending.requestId));
+      setFlushes((n) => n + 1);
     } catch (e) {
-      console.error(e);
-      mutatePoints((prev) =>
-        prev.map((pt) =>
-          pt.id === pointId ? { ...pt, mode: "error", error: String(e?.message || e) } : pt
+      setPendingCreates((prev) =>
+        prev.map((x) =>
+          x.requestId === pending.requestId
+            ? { ...x, isSaving: false, error: String(e?.message || e) }
+            : x
         )
       );
     }
   }
 
-  // 3) Add a dot and immediately create its street route to nearest pipe
-  function addPointAt(lat, lng, name) {
-    const id = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random());
-    const initiatedAtIso = new Date().toISOString();
-    const initiatedAtLabel = new Date(initiatedAtIso).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit"
-    });
+  function retryPendingCreate(requestId) {
+    const pending = pendingCreates.find((x) => x.requestId === requestId);
+    if (!pending || pending.isSaving) return;
+    startFlushCreate(pending);
+  }
 
+  function addPointAt(lat, lng, name) {
     flushCounterRef.current += 1;
     const finalName = name && String(name).trim().length ? name : `Test ${flushCounterRef.current}`;
-
-    setFlushes((n) => n + 1);
-
-    mutatePoints((p) => [
-      ...p,
-      {
-        id,
-        name: finalName,
-        lat,
-        lng,
-        mode: "street",
-        street: null,
-        contact: null,
-        pipe: null,
-        pipePlan: null,
-        error: null,
-        routingStatus: null,
-        fallbackUsed: false,
-        fallbackReason: "none",
-        fallbackBridge: null,
-        terminalNode: null,
-        currentVelocityBaseMps: null,
-        currentVelocitySimMps: null,
-        etaToDestinationSec: null,
-        persistedStatus: "active",
-        initiatedAtIso,
-        initiatedAtLabel
-      }
-    ]);
-
-    if (pipeData.geojson) {
-      buildStreetRouteForPoint(id, { lat, lng });
-    }
+    const startedAtIso = new Date().toISOString();
+    const requestId = `${Date.now()}-${Math.random()}`;
+    const pending = {
+      requestId,
+      name: finalName,
+      origin: { lat, lng },
+      startedAtIso,
+      isSaving: true,
+      error: null
+    };
+    setPendingCreates((prev) => [...prev, pending]);
+    startFlushCreate(pending);
   }
 
   // Convenience: add a point near the device location (tiny random offset)
@@ -2540,36 +2547,54 @@ export default function App() {
     return null;
   }
 
+  const reconcileActiveRuns = useCallback(async ({ replace = false, updatedAfter = null } = {}) => {
+    if (reconcileInFlightRef.current) return;
+    reconcileInFlightRef.current = true;
+    try {
+      const nowResp = await apiFetch("/api/time");
+      const params = new URLSearchParams({ status: "active", limit: "1000" });
+      if (updatedAfter) params.set("updated_after", updatedAfter);
+      const runs = await apiFetch(`/api/flushes?${params.toString()}`);
+      const nowMs = Date.parse(nowResp?.now || new Date().toISOString());
+      const incoming = (Array.isArray(runs) ? runs : [])
+        .map((r) => {
+          const point = buildPointFromPersistedRun(r, nowMs);
+          if (!point?.id) return null;
+          const ts = Date.parse(r.updated_at || r.started_at || new Date().toISOString());
+          return { point, ts };
+        })
+        .filter(Boolean);
 
-  // If a point was added before pipes loaded, route it once pipes arrive
-  useEffect(() => {
-    if (!pipeData.geojson) return;
-
-    const unrouted = pointsRef.current.filter((p) => p.mode === "street" && !p.street && !p.error);
-    if (unrouted.length === 0) return;
-
-    for (const p of unrouted) {
-      buildStreetRouteForPoint(p.id, { lat: p.lat, lng: p.lng });
+      mutatePoints((prev) => {
+        const next = replace ? [] : prev.slice();
+        const indexById = new Map(next.map((p, i) => [p.id, i]));
+        for (const { point, ts } of incoming) {
+          const oldTs = lastServerUpdateRef.current.get(point.id) ?? -Infinity;
+          if (ts < oldTs) continue;
+          lastServerUpdateRef.current.set(point.id, ts);
+          const idx = indexById.get(point.id);
+          if (idx === undefined) {
+            indexById.set(point.id, next.length);
+            next.push(point);
+          } else {
+            next[idx] = { ...next[idx], ...point };
+          }
+        }
+        return next;
+      });
+    } finally {
+      reconcileInFlightRef.current = false;
     }
-  }, [pipeData.geojson]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [buildPointFromPersistedRun, mutatePoints]);
 
   useEffect(() => {
     if (!pipeData.ready || restoredOnceRef.current) return;
     let cancelled = false;
     (async () => {
       try {
-        const nowResp = await apiFetch("/api/time");
-        const runs = await apiFetch("/api/flushes?status=active");
         if (cancelled) return;
-        const nowMs = Date.parse(nowResp?.now || new Date().toISOString());
-        const restored = (Array.isArray(runs) ? runs : [])
-          .map((r) => buildPointFromPersistedRun(r, nowMs))
-          .filter(Boolean);
-        restored.forEach((p) => {
-          if (p?.id && Number.isFinite(p.serverUpdatedAtMs)) lastServerUpdateRef.current.set(p.id, p.serverUpdatedAtMs);
-        });
-        pointsRef.current = restored;
-        setRenderPoints(restored);
+        await reconcileActiveRuns({ replace: true });
+        if (cancelled) return;
         restoredOnceRef.current = true;
       } catch (e) {
         if (cancelled) return;
@@ -2579,7 +2604,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [pipeData.ready, buildPointFromPersistedRun]);
+  }, [pipeData.ready, reconcileActiveRuns]);
 
   useEffect(() => {
     if (!pipeData.ready) return;
@@ -2605,6 +2630,14 @@ export default function App() {
       } catch (e) {
         console.warn("flush_created parse failed", e);
       }
+    });
+
+    es.addEventListener("connected", () => {
+      const latest = Array.from(lastServerUpdateRef.current.values()).reduce((m, v) => Math.max(m, v), -Infinity);
+      const updatedAfter = Number.isFinite(latest) ? new Date(latest).toISOString() : null;
+      reconcileActiveRuns({ replace: false, updatedAfter }).catch((e) => {
+        console.warn("sse connected reconcile failed", e);
+      });
     });
 
     es.addEventListener("flush_status_updated", (evt) => {
@@ -2646,13 +2679,20 @@ export default function App() {
     });
 
     es.onerror = () => {
-      // EventSource retries automatically; no-op.
+      const now = Date.now();
+      if (now - lastSseReconcileMsRef.current < 5000) return;
+      lastSseReconcileMsRef.current = now;
+      const latest = Array.from(lastServerUpdateRef.current.values()).reduce((m, v) => Math.max(m, v), -Infinity);
+      const updatedAfter = Number.isFinite(latest) ? new Date(latest).toISOString() : null;
+      reconcileActiveRuns({ replace: false, updatedAfter }).catch((e) => {
+        console.warn("sse drift reconcile failed", e);
+      });
     };
 
     return () => {
       es.close();
     };
-  }, [pipeData.ready, buildPointFromPersistedRun, mutatePoints]);
+  }, [pipeData.ready, buildPointFromPersistedRun, mutatePoints, reconcileActiveRuns]);
 
   useEffect(() => {
     const terminalish = renderPoints.filter(
@@ -2898,6 +2938,22 @@ export default function App() {
           <div className="counterSub">Updated: {APP_LAST_UPDATED}</div>
           <div className="counter">Flushes: {flushes}</div>
           <div className="counterSub">{pipeStats}</div>
+          {pendingCreates.length > 0 && (
+            <div className="counterSub">
+              Saving flushes: {pendingCreates.filter((p) => p.isSaving).length}
+            </div>
+          )}
+          {pendingCreates.map((p) => (
+            <div key={p.requestId} className="counterSub">
+              {p.name}: {p.isSaving ? "Saving flush..." : `Save failed (${p.error || "unknown"})`}
+              {!p.isSaving && (
+                <>
+                  {" "}
+                  <button className="inlineRetryBtn" onClick={() => retryPendingCreate(p.requestId)}>Retry</button>
+                </>
+              )}
+            </div>
+          ))}
 
           {users.map((u) => (
             <button key={u} onClick={() => addPoint(u)}>

@@ -1,0 +1,4 @@
+# Runtime SQLite artifacts (do not commit)
+server/data/*.db
+server/data/*.db-shm
+server/data/*.db-wal

@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+
+
+
+<!-- template name: html.form.login.landgate.template.html -->
+
+
+<!-- Configurable default behavior for the Remember Username checkbox -->
+            <!-- set the checkbox to unchecked -->
+            
+
+<html lang="en" dir="ltr">
+
+<head>
+
+    <base href="https://sso.slip.wa.gov.au/"/>
+
+    <title>LOGIN</title>
+
+    <meta name="robots" content="noindex, nofollow" />
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <meta name="viewport" content="initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta http-equiv="x-ua-compatible" content="IE=edge" />
+
+    <link rel="stylesheet" media="all" type="text/css" href="assets/css/main.css" />
+    <link rel="stylesheet" media="all" type="text/css" href="assets/css/main-custom.css"/>
+    <link rel="stylesheet" media="all" type="text/css" href="assets/css/landgate-template-common.css"/>
+    <link rel="stylesheet" media="all" type="text/css" href="assets/css/html.form.login.landgate.template.css"/>
+
+</head>
+
+<body>
+
+    <div class="ping-container ping-signin login-template">
+
+        
+        <!-- start header -->
+        <header id="top" role="banner" style="margin: 0 auto;">
+            <!-- start .page-wrapper -->
+            <div class="page-wrapper">
+                <!-- start .top-nav -->
+                <div class="top-nav">
+                    <!-- start .top-nav-wrapper -->
+                    <div class="top-nav-wrapper">
+                        <!-- start .links -->
+                        <!-- <ul class="links">
+                            <li><a href="https://www.landgate.wa.gov.au/about-us" title="About us page" tabindex="4">About us</a></li>
+                            <li><a href="https://www.landgate.wa.gov.au/contact-us" title="Contact us page">Contact us</a></li>
+                        </ul> -->
+                        <!-- end .links -->
+                        <!-- start .buttons -->
+                        <!-- end .buttons -->
+                    </div>
+                    <!-- end .top-nav-wrapper -->
+                </div>
+                <!-- end .top-nav -->
+                <!-- start .logos -->
+                <div class="logos">
+                    <a href="https://data.wa.gov.au" title="Homepage of SLIP website" tabindex="3">
+                    <img src="assets/images/corporate/logos.jpg" alt="Homepage of SLIP website" class="combinedLogo">
+                    </a>
+                </div>
+                <!-- end .logos -->
+            </div>
+            <!-- end .page-wrapper -->
+        </header>
+        <!-- end header -->
+
+
+        <div class="ping-body-container">
+
+            <div class="ping-adapter-login-form">
+
+                <div class="ping-header-title">
+                LOGIN
+                </div>
+
+                <form method="POST" action="/as/SpTdA/resume/as/authorization.ping" autocomplete="off">
+
+                    <div class="ping-messages">
+                                                
+                                                
+                    </div>
+
+                    <div class="ping-input-label">
+                        Email Address
+                    </div>
+                    <div class="ping-input-container">
+                                                    <input id="username" type="text" size="36" name="pf.username" value="" autocorrect="off" autocapitalize="off" onKeyPress="return postOnReturn(event)"  /><!---->
+                                                <div class="place-bottom type-alert tooltip-text" id="username-text">
+                            <div class="icon">!</div>
+                            Please fill out this field.
+                        </div>
+                    </div>
+
+                    <div class="ping-input-label">
+                        Password
+                    </div>
+                    <div class="ping-input-container password-container">
+                        <input id="password" type="password" size="36" name="pf.pass" onKeyPress="return postOnReturn(event)" />
+                        <div class="place-bottom type-alert tooltip-text" id="password-text">
+                            <div class="icon">!</div>
+                            Please fill out this field.
+                        </div>
+                    </div>
+
+                    
+                    <div class="ping-buttons">
+                        <input type="hidden" name="pf.ok" value="" />
+                        <input type="hidden" name="pf.cancel" value="" />
+
+                        <a onclick="postOk();" class="ping-button normal allow" title="Login">
+                        Login
+                        </a>
+                    </div><!-- .ping-buttons -->
+
+                                        <div class="ping-input-link ping-pass-change account-actions">
+                                                <a href="/as/SpTdA/resume/as/authorization.ping?ChangePassword=true" class="password-change">Change your password</a>
+                                                                        <span class="divider">|</span>
+                                                                        <input type="hidden" name="pf.passwordreset" value=""/>
+                        <a onclick="postForgotPassword();" class="forgot-password">Forgotten Password?</a>
+                                            </div>
+                    
+                                        <div class="ping-register">
+                        <input type="hidden" name="pf.registration" value=""/>
+                        Don't have an Login? <a onclick="postRegistration();">Register now</a>
+                    </div>
+                    
+                    <!-- #recaptcha -->
+                    
+                    <input type="hidden" name="pf.adapterId" id="pf.adapterId" value="pingDirectoryAdapter" />
+                </form>
+
+                <div class="register-info">
+                    <p>&nbsp;</p>
+                    <p>
+                      <strong>Why Register?</strong> Registering for a SLIP
+                      <a href="https://toolkit.data.wa.gov.au/hc/en-gb/articles/115009696588-">account</a>
+                      gives you access to SLIP Public Data Downloads and is the first step in accessing other data services or linking to your organisation
+                      <a href="https://toolkit.data.wa.gov.au/hc/en-gb/articles/360001068616">access</a>
+                    </p>
+
+                </div>
+
+            </div> <!-- ping-adapter-login-form -->
+
+        </div> <!-- ping-body-container -->
+
+        <!-- start footer -->
+        <footer role="contentinfo" style="background-color:#F5F5F4">
+            <!-- start .page-wrapper -->
+            <div class="page-wrapper" style="background-color:#007095">
+                <!-- start .bottom-links -->
+                <section class="bottom-links-container">
+                    <a class="wa-gov" href="https://data.wa.gov.au">data.wa.gov.au</a><br/>
+                </section>
+                <section class="bottom-links-container-centred">
+                    <ul class="bottom-links">
+                        <li><a href="https://data.wa.gov.au/privacy" title="Privacy page">Privacy</a></li>
+                        <li><a href="https://data.wa.gov.au/copyright" title="Copyright page">Copyright</a></li>
+                        <li><a href="https://data.wa.gov.au/disclaimer" title="Disclaimer page">Disclaimer</a></li>
+                    </ul>
+                    <span class="wa-info-auth">Western Australian Land Information Authority</span>
+                </section>
+                <!-- end .bottom-links -->
+            </div>
+            <!-- end .page-wrapper -->
+        </footer>
+        <!-- end footer -->
+
+    </div> <!-- ping-container -->
+
+    <script type="text/javascript">
+
+        function postForgotPassword() {
+            document.forms[0]['pf.passwordreset'].value = 'clicked';
+            document.forms[0].submit();
+        }
+
+        function postRecoverUsername() {
+            document.forms[0]['pf.usernamerecovery'].value = 'clicked';
+            document.forms[0].submit();
+        }
+
+        function postAlternateAuthnSystem(system) {
+            document.forms[0]['pf.alternateAuthnSystem'].value = system;
+            document.forms[0].submit();
+        }
+
+        function postRegistration()
+        {
+            document.forms[0]['pf.registration'].value = true;
+            document.forms[0].submit();
+        }
+
+        function postOk() {
+            if (false) {
+                grecaptcha.execute();
+            }
+            else {
+                if (document.forms[0]['pf.username'].value === '') {
+                    document.getElementById('username-text').className += ' show';
+                }
+                if (document.forms[0]['pf.pass'].value === '') {
+                    document.getElementById('password-text').className += ' show';
+                }
+                else {
+                    submitForm()
+                }
+            }
+
+        }
+
+        function submitForm()
+        {
+            document.forms[0]['pf.ok'].value = 'clicked';
+            document.forms[0].submit();
+            if(false) {
+                grecaptcha.reset();
+            }
+        }
+
+        function postCancel() {
+            document.forms[0]['pf.cancel'].value = 'clicked';
+            document.forms[0].submit();
+        }
+
+        function postOnReturn(e) {
+            // remove error tips
+            if (document.forms[0]['pf.username'].value !== '') {
+                document.getElementById('username-text').className = 'place-bottom type-alert tooltip-text';
+            }
+            if (document.forms[0]['pf.pass'].value !== '') {
+                document.getElementById('password-text').className = 'place-bottom type-alert tooltip-text';
+            }
+
+            var keycode;
+            if (window.event) keycode = window.event.keyCode;
+            else if (e) keycode = e.which;
+            else return true;
+
+            if (keycode == 13) {
+                document.forms[0].submit();
+                return false;
+            } else {
+                return true;
+            }
+        }
+
+        function setFocus() {
+            var platform = navigator.platform;
+            if (platform != null && platform.indexOf("iPhone") == -1) {
+                                    document.getElementById('username').focus();
+                            }
+        }
+
+        /*
+        function setMobile(mobile) {
+            var className = ' mobile',
+                hasClass = (bodyTag.className.indexOf(className) !== -1);
+
+            if (mobile && !hasClass) {
+                bodyTag.className += className;
+
+            } else if (!mobile && hasClass) {
+                bodyTag.className = bodyTag.className.replace(className, '');
+            }
+
+            
+            <!-- Check if this is the PingOne Mobile App -->
+                    }
+        */
+
+        function getScreenWidth() {
+            return (window.outerHeight) ? window.outerWidth : document.body.clientWidth;
+        }
+
+        var bodyTag = document.getElementsByTagName('body')[0],
+            width = getScreenWidth(),
+            remember = false && false;
+
+        // set container
+        
+        
+        /*
+        if (/Android|webOS|iPhone|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)) {
+            setMobile(true);
+        } else {
+            setMobile((width <= 480));
+            window.onresize = function() {
+                width = getScreenWidth();
+                setMobile((width <= 480));
+            }
+        }
+        */
+    </script>
+
+</body>
+
+</html>
