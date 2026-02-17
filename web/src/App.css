@@ -188,6 +188,23 @@
   opacity: 0.86;
 }
 
+.settingsFieldLabel {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  opacity: 0.8;
+}
+
+.settingsSelect {
+  width: 100%;
+  border: 1px solid #2c2f35;
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: #181a1f;
+  color: #fff;
+  font-size: 14px;
+}
+
 .settingsSection button {
   width: 100%;
   border: 0;

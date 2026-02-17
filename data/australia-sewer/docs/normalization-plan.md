@@ -8,7 +8,24 @@ Date: 2026-02-17
 - `data/australia-sewer/raw/chw-sewermains.geojson` (GeoJSON, ~18 MB)
 - `data/australia-sewer/raw/bundaberg-sewerage-network.zip` (FileGDB ZIP, ~2.4 MB)
 - `data/australia-sewer/raw/goldcoast-sewer-pipes-non-pressurised.csv` (CSV, ~23 MB)
+- `data/australia-sewer/raw/goldcoast-sewer-pipes-non-pressurised.geojson` (ArcGIS Hub GeoJSON, ~160 MB)
 - WA Water Corporation endpoints (`WCORP-068`, `WCORP-069`) currently return SSO login HTML unless authenticated.
+
+## Current Processing Status
+
+Completed outputs:
+
+- `data/australia-sewer/normalized/goldcoast-sewer-pipes-non-pressurised.normalized.geojson`
+- `data/australia-sewer/normalized/bundaberg-sewerage-mains.normalized.geojson`
+
+Counts:
+
+- Gold Coast: 91,859 features (line geometry present, key engineering attributes populated)
+- Bundaberg: 26,064 features (line geometry present)
+
+Bundaberg caveat:
+
+- The published `IN_Sewerage_Mains` attributes currently have engineering fields mostly/null in the delivered GDB (`pipeDiameter`, `upstreamManholeIL`, `downstreamManholeIL`, etc.). The normalized output therefore carries geometry and source metadata but limited hydraulic attributes.
 
 ## Target Schema For This App
 

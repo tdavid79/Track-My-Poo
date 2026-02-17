@@ -15,7 +15,27 @@ const SEGMENT_INDEX_CELL_M = 80;
 const NODE_INDEX_CELL_M = 120;
 const FALLBACK_MAX_BRIDGE_M = 250;
 const ROUTING_FALLBACK_DEFAULT = "guarantee_endpoint";
-const PIPE_GEOJSON_PATH = "/Sewerage_Network_Main_Pipelines.geojson";
+const PIPE_DATASETS = [
+  {
+    id: "melbourne",
+    label: "Melbourne",
+    path: "/Sewerage_Network_Main_Pipelines.geojson",
+    center: { lat: -37.885, lng: 145.01 }
+  },
+  {
+    id: "gold_coast",
+    label: "Gold Coast",
+    path: "/goldcoast-sewer-pipes-non-pressurised.normalized.geojson",
+    center: { lat: -28.03, lng: 153.39 }
+  },
+  {
+    id: "bundaberg",
+    label: "Bundaberg",
+    path: "/bundaberg-sewerage-mains.normalized.geojson",
+    center: { lat: -24.87, lng: 152.35 }
+  }
+];
+const DEFAULT_PIPE_DATASET_ID = "melbourne";
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8787";
 const TRUE_ENDPOINT_NAME_PRIORITY = [
   "WESTERN TRUNK SEWER",
@@ -32,7 +52,7 @@ const POO_ICON = divIcon({
   iconAnchor: [12, 12]
 });
 
-// Fallback centre (Elsternwick-ish) if geolocation is blocked/unavailable
+// Fallback centre (Melbourne / Elsternwick-ish) if geolocation is blocked/unavailable
 const FALLBACK_CENTER = { lat: -37.885, lng: 145.01 };
 
 // Public OSRM demo server (OK for prototyping; consider self-hosting for reliability/scale)
@@ -1448,6 +1468,9 @@ const MovingPointsLayer = memo(function MovingPointsLayer({ points, showLabels, 
 function SettingsModal({
   isOpen,
   onClose,
+  locationId,
+  setLocationId,
+  locationOptions,
   perfMode,
   setPerfMode,
   showLabels,
@@ -1479,6 +1502,25 @@ function SettingsModal({
           <button className="settingsCloseBtn" onClick={onClose} aria-label="Close settings">
             x
           </button>
+        </div>
+
+        <div className="settingsSection">
+          <h4>Location</h4>
+          <label className="settingsFieldLabel" htmlFor="network-location-select">
+            Sewer network dataset
+          </label>
+          <select
+            id="network-location-select"
+            className="settingsSelect"
+            value={locationId}
+            onChange={(e) => setLocationId(e.target.value)}
+          >
+            {locationOptions.map((opt) => (
+              <option key={opt.id} value={opt.id}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
         </div>
 
         <div className="settingsSection">
@@ -1552,6 +1594,11 @@ function SettingsModal({
 }
 
 export default function App() {
+  const storedDatasetId =
+    typeof window !== "undefined" ? window.localStorage.getItem("flush:pipeDatasetId") : null;
+  const initialPipeDatasetId = PIPE_DATASETS.some((d) => d.id === storedDatasetId)
+    ? storedDatasetId
+    : DEFAULT_PIPE_DATASET_ID;
   const storedLoc =
     typeof window !== "undefined" ? window.localStorage.getItem("flush:lastDeviceLoc") : null;
   const parsedStoredLoc = (() => {
@@ -1566,6 +1613,11 @@ export default function App() {
   })();
 
   const [flushes, setFlushes] = useState(0);
+  const [pipeDatasetId, setPipeDatasetId] = useState(initialPipeDatasetId);
+  const selectedPipeDataset = useMemo(
+    () => PIPE_DATASETS.find((d) => d.id === pipeDatasetId) || PIPE_DATASETS[0],
+    [pipeDatasetId]
+  );
 
   const [clickToFlush, setClickToFlush] = useState(false);
   const flushCounterRef = useRef(0);
@@ -1637,6 +1689,24 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem("flush:pipeDatasetId", pipeDatasetId);
+    } catch {
+      // ignore storage errors
+    }
+  }, [pipeDatasetId]);
+
+  useEffect(() => {
+    mutatePoints(() => []);
+    if (mapRef.current) {
+      mapRef.current.setView([selectedPipeDataset.center.lat, selectedPipeDataset.center.lng], 12);
+      initialViewportSetRef.current = true;
+    } else {
+      initialViewportSetRef.current = false;
+    }
+  }, [selectedPipeDataset.id, selectedPipeDataset.center.lat, selectedPipeDataset.center.lng, mutatePoints]);
+
+  useEffect(() => {
     if (!isSettingsOpen) return;
     const onKeyDown = (e) => {
       if (e.key === "Escape") setIsSettingsOpen(false);
@@ -1652,8 +1722,8 @@ export default function App() {
     async function load() {
       try {
         const startedAt = performance.now();
-        perfLog("load start", { path: PIPE_GEOJSON_PATH });
-        const res = await fetch(PIPE_GEOJSON_PATH);
+        perfLog("load start", { path: selectedPipeDataset.path, location: selectedPipeDataset.id });
+        const res = await fetch(selectedPipeDataset.path);
         if (!res.ok) throw new Error(`GeoJSON fetch failed: ${res.status}`);
         const gj = await res.json();
 
@@ -1971,7 +2041,8 @@ export default function App() {
         const segmentIndex = buildSegmentSpatialIndex(features);
         const nodeSpatialIndex = buildNodeSpatialIndex(downstreamNodes);
         perfLog("load done", {
-          path: PIPE_GEOJSON_PATH,
+          path: selectedPipeDataset.path,
+          location: selectedPipeDataset.id,
           features: features.length,
           cells: segmentIndex.cells.size,
           terminalNodes: terminalNodes.length,
@@ -2040,7 +2111,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [selectedPipeDataset.id, selectedPipeDataset.path]);
 
   // 2) Ask browser for device location; use it as spawn point
   useEffect(() => {
@@ -2937,6 +3008,7 @@ export default function App() {
         <div className="sidebarTop">
           <div className="counterSub">Updated: {APP_LAST_UPDATED}</div>
           <div className="counter">Flushes: {flushes}</div>
+          <div className="counterSub">Location: {selectedPipeDataset.label}</div>
           <div className="counterSub">{pipeStats}</div>
           {pendingCreates.length > 0 && (
             <div className="counterSub">
@@ -2981,7 +3053,7 @@ export default function App() {
           My location
         </button>
         <MapContainer
-          center={[FALLBACK_CENTER.lat, FALLBACK_CENTER.lng]}
+          center={[selectedPipeDataset.center.lat, selectedPipeDataset.center.lng]}
           zoom={13}
           preferCanvas
           style={{ height: "100%", width: "100%" }}
@@ -3011,6 +3083,9 @@ export default function App() {
         <SettingsModal
           isOpen={isSettingsOpen}
           onClose={() => setIsSettingsOpen(false)}
+          locationId={pipeDatasetId}
+          setLocationId={setPipeDatasetId}
+          locationOptions={PIPE_DATASETS}
           perfMode={perfMode}
           setPerfMode={setPerfMode}
           showLabels={showLabels}

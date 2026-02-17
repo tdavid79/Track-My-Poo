@@ -11,7 +11,9 @@ This repo now has two apps:
 
 1. `web/` (React + Vite + Leaflet)
 - Renders sewer network overlays from:
-  - `/web/public/Sewerage_Network_Main_Pipelines.geojson`
+  - `/web/public/Sewerage_Network_Main_Pipelines.geojson` (Melbourne)
+  - `/web/public/goldcoast-sewer-pipes-non-pressurised.normalized.geojson`
+  - `/web/public/bundaberg-sewerage-mains.normalized.geojson`
 - Simulates flush movement (street phase -> pipe phase -> arrived/error).
 - Uses 💩 markers and on-map labels with:
   - started time
@@ -89,7 +91,8 @@ VITE_API_BASE_URL=http://localhost:8787 npm run dev
 4. Watch movement + labels update in real time.
 5. Open a second browser window to verify live sync via SSE.
 6. Use `Settings` floating button for routing/overlay/performance controls.
-7. Use `My location` floating button to recenter.
+7. Use `Settings -> Location` to switch between Melbourne, Gold Coast, and Bundaberg networks.
+8. Use `My location` floating button to recenter.
 
 ## Persistence + Realtime API
 

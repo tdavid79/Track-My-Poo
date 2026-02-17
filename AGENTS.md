@@ -19,7 +19,10 @@ The app simulates flush travel in two phases:
 - Frontend core: `web/src/App.jsx`
 - Frontend styles: `web/src/App.css`
 - Frontend entry: `web/src/main.jsx`
-- Main network file: `web/public/Sewerage_Network_Main_Pipelines.geojson`
+- Network files:
+  - `web/public/Sewerage_Network_Main_Pipelines.geojson` (Melbourne)
+  - `web/public/goldcoast-sewer-pipes-non-pressurised.normalized.geojson`
+  - `web/public/bundaberg-sewerage-mains.normalized.geojson`
 - Backend API: `server/src/index.js`
 - Root startup script: `start-dev.sh`
 - Product docs: `README.md`
