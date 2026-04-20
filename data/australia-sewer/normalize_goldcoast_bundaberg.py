@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import fiona
+from fiona.transform import transform_geom
 
 
 ROOT = Path(__file__).resolve().parent
@@ -75,7 +76,11 @@ def normalize_bundaberg():
 
     out_features = []
     with fiona.open(gdb, layer="IN_Sewerage_Mains") as src:
+        src_crs = src.crs_wkt or src.crs
         for feat in src:
+            raw_geom = to_plain_geometry(feat.get("geometry"))
+            if not raw_geom:
+                continue
             props = feat.get("properties") or {}
             up_il = to_float(props.get("upstreamManholeIL"))
             down_il = to_float(props.get("downstreamManholeIL"))
@@ -119,7 +124,7 @@ def normalize_bundaberg():
                 {
                     "type": "Feature",
                     "properties": normalized,
-                    "geometry": to_plain_geometry(feat.get("geometry")),
+                    "geometry": to_plain_geometry(transform_geom(src_crs, "EPSG:4326", raw_geom, antimeridian_cutting=False)),
                 }
             )
 

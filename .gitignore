@@ -1,4 +1,32 @@
-# Runtime SQLite artifacts (do not commit)
+# Runtime SQLite artifacts
 server/data/*.db
 server/data/*.db-shm
 server/data/*.db-wal
+
+# Dependencies
+node_modules/
+web/node_modules/
+server/node_modules/
+
+# Build output
+web/dist/
+web/dist-ssr/
+
+# Large raw GeoJSON data files (use Git LFS or host separately)
+data/australia-sewer/raw/
+data/australia-sewer/normalized/
+web/public/goldcoast-sewer-pipes-non-pressurised.normalized.geojson
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Rust build artifacts
+target/
+
+# OS / editor
+.DS_Store
+*.local
+.env
+.env.local

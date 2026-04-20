@@ -67,7 +67,6 @@ const NODE_SNAP_TOL_M = 8;
 
 // Simulation safety clamps
 const PIPE_SPEED_MIN_MPS = 0.2;
-const PIPE_SPEED_MAX_MPS = 3.0;
 
 const R_MERC = 6378137;
 
@@ -1045,7 +1044,7 @@ function buildPipePlanFromObjectId(
     }
 
     if (first && startPoint) {
-      plan.push({ lng: startPoint.lng, lat: startPoint.lat });
+      plan.push({ lng: startPoint.lng, lat: startPoint.lat, objectId: currentId });
 
       let nearestIdx = 0;
       let bestDist = Infinity;
@@ -1061,7 +1060,7 @@ function buildPipePlanFromObjectId(
         const k = gridKey(ord[i], 5);
         if (visitedCells.has(k)) continue;
         visitedCells.add(k);
-        plan.push(ord[i]);
+        plan.push({ ...ord[i], objectId: currentId });
       }
 
       first = false;
@@ -1073,7 +1072,7 @@ function buildPipePlanFromObjectId(
         const k = gridKey(pt, 5);
         if (visitedCells.has(k)) continue;
         visitedCells.add(k);
-        plan.push(pt);
+        plan.push({ ...pt, objectId: currentId });
       }
     }
 
@@ -1487,8 +1486,8 @@ function SettingsModal({
   setShowStreetRoutes,
   showPipePlans,
   setShowPipePlans,
-  speed10x,
-  setSpeed10x,
+  speedMult,
+  cycleSpeed,
   clickToFlush,
   setClickToFlush
 }) {
@@ -1581,8 +1580,8 @@ function SettingsModal({
 
         <div className="settingsSection">
           <h4>Simulation</h4>
-          <button onClick={() => setSpeed10x((v) => !v)}>
-            {speed10x ? "Speed: 10x" : "Speed: 1x"}
+          <button onClick={cycleSpeed}>
+            Speed: {speedMult}x
           </button>
           <button onClick={() => setClickToFlush((v) => !v)}>
             {clickToFlush ? "Click-to-flush: ON" : "Click-to-flush: OFF"}
@@ -1623,6 +1622,7 @@ export default function App() {
   const flushCounterRef = useRef(0);
 
   const [pipeData, setPipeData] = useState({
+    datasetId: null,
     ready: false,
     geojson: null,
     bbox: null,
@@ -1652,7 +1652,8 @@ export default function App() {
 
   const [showStreetRoutes, setShowStreetRoutes] = useState(true);
   const [showPipePlans, setShowPipePlans] = useState(true);
-  const [speed10x, setSpeed10x] = useState(false);
+  const [speedMult, setSpeedMult] = useState(1);
+  const cycleSpeed = useCallback(() => setSpeedMult((v) => v === 1 ? 10 : v === 10 ? 100 : 1), []);
   const [perfMode, setPerfMode] = useState(PERF_MODE_DEFAULT);
   const isMobileViewport = useMemo(
     () => (typeof window !== "undefined" ? window.matchMedia("(max-width: 900px)").matches : false),
@@ -1688,6 +1689,21 @@ export default function App() {
     return next;
   }, []);
 
+  const clearAll = useCallback(() => {
+    const active = pointsRef.current.filter((p) => p.id && p.mode !== "arrived" && p.mode !== "error");
+    active.forEach((p) => {
+      apiFetch(`/api/flushes/${encodeURIComponent(p.id)}/status`, {
+        method: "PATCH",
+        body: JSON.stringify({ status: "error", errorMessage: "cleared_by_user" })
+      }).catch(() => {});
+    });
+    pointsRef.current = [];
+    setRenderPoints([]);
+    setPendingCreates([]);
+    setFlushes(0);
+    flushCounterRef.current = 0;
+  }, []);
+
   useEffect(() => {
     try {
       window.localStorage.setItem("flush:pipeDatasetId", pipeDatasetId);
@@ -1699,11 +1715,9 @@ export default function App() {
   useEffect(() => {
     mutatePoints(() => []);
     if (mapRef.current) {
-      mapRef.current.setView([selectedPipeDataset.center.lat, selectedPipeDataset.center.lng], 12);
-      initialViewportSetRef.current = true;
-    } else {
-      initialViewportSetRef.current = false;
+      mapRef.current.setView([selectedPipeDataset.center.lat, selectedPipeDataset.center.lng], 7);
     }
+    initialViewportSetRef.current = false;
   }, [selectedPipeDataset.id, selectedPipeDataset.center.lat, selectedPipeDataset.center.lng, mutatePoints]);
 
   useEffect(() => {
@@ -1723,6 +1737,11 @@ export default function App() {
       try {
         const startedAt = performance.now();
         perfLog("load start", { path: selectedPipeDataset.path, location: selectedPipeDataset.id });
+        setPipeData((prev) => ({
+          ...prev,
+          datasetId: selectedPipeDataset.id,
+          ready: false
+        }));
         const res = await fetch(selectedPipeDataset.path);
         if (!res.ok) throw new Error(`GeoJSON fetch failed: ${res.status}`);
         const gj = await res.json();
@@ -2062,6 +2081,7 @@ export default function App() {
         if (cancelled) return;
 
         setPipeData({
+          datasetId: selectedPipeDataset.id,
           ready: true,
           geojson: gj,
           bbox,
@@ -2085,6 +2105,7 @@ export default function App() {
         if (cancelled) return;
         console.error(e);
         setPipeData({
+          datasetId: selectedPipeDataset.id,
           ready: false,
           geojson: null,
           bbox: null,
@@ -2112,6 +2133,22 @@ export default function App() {
       cancelled = true;
     };
   }, [selectedPipeDataset.id, selectedPipeDataset.path]);
+
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+    if (!pipeData.ready || !pipeData.bbox) return;
+    if (pipeData.datasetId !== selectedPipeDataset.id) return;
+
+    const { minLat, minLng, maxLat, maxLng } = pipeData.bbox;
+    mapRef.current.fitBounds(
+      [
+        [minLat, minLng],
+        [maxLat, maxLng]
+      ],
+      { padding: [30, 30], maxZoom: 13 }
+    );
+    initialViewportSetRef.current = true;
+  }, [mapReady, pipeData.ready, pipeData.bbox, pipeData.datasetId, selectedPipeDataset.id]);
 
   // 2) Ask browser for device location; use it as spawn point
   useEffect(() => {
@@ -2144,7 +2181,7 @@ export default function App() {
       {
         enableHighAccuracy: true,
         timeout: 8000,
-        maximumAge: 60000
+        maximumAge: 0
       }
     );
   }, []);
@@ -2511,7 +2548,7 @@ export default function App() {
 
     const props = contact.feature?.properties || {};
     const objectId = toNum(props.OBJECTID);
-    const contactPipeV = clamp(toNum(props._v_half_mps) || PIPE_SPEED_MIN_MPS, PIPE_SPEED_MIN_MPS, PIPE_SPEED_MAX_MPS);
+    const contactPipeV = Math.max(PIPE_SPEED_MIN_MPS, toNum(props._v_half_mps) || PIPE_SPEED_MIN_MPS);
     const route = await fetchOsrmRoute(startLL, contact.point);
     const pipeRoute = objectId !== null ? buildPipeRouteResult(objectId, contact.point) : null;
     const persisted = await apiFetch("/api/flushes", {
@@ -2805,7 +2842,6 @@ export default function App() {
       }
       lastTs = ts;
       const cappedDtMs = Math.min(100, dtMs);
-      const speedMult = speed10x ? 10 : 1;
       const withTelemetry = (obj, base, sim, eta) => ({
         ...obj,
         currentVelocityBaseMps: Number.isFinite(base) ? base : null,
@@ -2851,7 +2887,7 @@ export default function App() {
             const ft = pipeData.byObjectId.get(objectId);
             const props = ft?.properties || {};
             const vRaw = toNum(props._v_half_mps) || 0;
-            const v = clamp(vRaw, PIPE_SPEED_MIN_MPS, PIPE_SPEED_MAX_MPS);
+            const v = Math.max(PIPE_SPEED_MIN_MPS, vRaw);
             const simV = v * speedMult;
             const here2 = { lat: moved.lat, lng: moved.lng };
             const eta = v > 0 ? remainingDistanceOnPath(moved.pipePlan, 1, here2) / v : null;
@@ -2895,12 +2931,12 @@ export default function App() {
           }
 
           let speed = pt.pipe?.speedMps || 0.6;
-          const objectId = pt.pipe?.objectId;
+          const objectId = target?.objectId ?? pt.pipe?.objectId;
           if (pipeData.byObjectId && objectId !== null && objectId !== undefined) {
             const ft = pipeData.byObjectId.get(objectId);
             const props = ft?.properties || {};
             const vRaw = toNum(props._v_half_mps) || speed;
-            speed = clamp(vRaw, PIPE_SPEED_MIN_MPS, PIPE_SPEED_MAX_MPS);
+            speed = Math.max(PIPE_SPEED_MIN_MPS, vRaw);
           }
 
           const here = { lat: pt.lat, lng: pt.lng };
@@ -2915,7 +2951,7 @@ export default function App() {
               ...pt,
               lat: target.lat,
               lng: target.lng,
-              pipe: { ...pt.pipe, idx: nextIdx, speedMps: speed },
+              pipe: { ...pt.pipe, idx: nextIdx, speedMps: speed, objectId: objectId ?? pt.pipe?.objectId },
               mode: atEnd ? "arrived" : "pipe"
             };
             if (atEnd) return withTelemetry(nextPipe, 0, 0, 0);
@@ -2962,7 +2998,7 @@ export default function App() {
 
     rafId = requestAnimationFrame(frameStep);
     return () => cancelAnimationFrame(rafId);
-  }, [perfMode, pipeData.byObjectId, speed10x]);
+  }, [perfMode, pipeData.byObjectId, speedMult]);
 
   const pipeStats = useMemo(() => {
     if (!pipeData.ready) return "Pipes: loading…";
@@ -3036,11 +3072,14 @@ export default function App() {
 
         <div className="sidebarBottom">
           <div className="sidebarSectionTitle">Simulation</div>
-          <button onClick={() => setSpeed10x((v) => !v)}>
-            {speed10x ? "Speed: 10x" : "Speed: 1x"}
+          <button onClick={cycleSpeed}>
+            Speed: {speedMult}x
           </button>
           <button onClick={() => setClickToFlush((v) => !v)}>
             {clickToFlush ? "Click-to-flush: ON" : "Click-to-flush: OFF"}
+          </button>
+          <button onClick={clearAll}>
+            Clear All
           </button>
         </div>
       </div>
@@ -3102,8 +3141,8 @@ export default function App() {
           setShowStreetRoutes={setShowStreetRoutes}
           showPipePlans={showPipePlans}
           setShowPipePlans={setShowPipePlans}
-          speed10x={speed10x}
-          setSpeed10x={setSpeed10x}
+          speedMult={speedMult}
+          cycleSpeed={cycleSpeed}
           clickToFlush={clickToFlush}
           setClickToFlush={setClickToFlush}
         />
