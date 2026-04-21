@@ -184,6 +184,26 @@ function remainingDistanceOnPath(path, idx, currentLL) {
   return d;
 }
 
+function remainingTimeOnPath(path, idx, currentLL, byObjectId, fallbackSpeed) {
+  if (!Array.isArray(path) || !currentLL) return 0;
+  const target = path[idx];
+  if (!target) return 0;
+
+  const segSpeed = (waypoint) => {
+    if (byObjectId && waypoint?.objectId != null) {
+      const v = toNum(byObjectId.get(waypoint.objectId)?.properties?._v_half_mps);
+      if (v > 0) return Math.max(PIPE_SPEED_MIN_MPS, v);
+    }
+    return fallbackSpeed;
+  };
+
+  let t = metersBetween(currentLL, target) / segSpeed(target);
+  for (let i = idx + 1; i < path.length; i++) {
+    t += metersBetween(path[i - 1], path[i]) / segSpeed(path[i]);
+  }
+  return t;
+}
+
 function formatEta(sec) {
   if (!Number.isFinite(sec) || sec < 0) return "—";
   const s = Math.max(0, Math.round(sec));
@@ -2890,7 +2910,7 @@ export default function App() {
             const v = Math.max(PIPE_SPEED_MIN_MPS, vRaw);
             const simV = v * speedMult;
             const here2 = { lat: moved.lat, lng: moved.lng };
-            const eta = v > 0 ? remainingDistanceOnPath(moved.pipePlan, 1, here2) / v : null;
+            const eta = remainingTimeOnPath(moved.pipePlan, 1, here2, pipeData.byObjectId, v);
 
             return withTelemetry({
               ...moved,
@@ -2911,10 +2931,11 @@ export default function App() {
           const baseV = pt.street.speedMps;
           const simV = baseV * speedMult;
           const remainingStreetM = remainingDistanceOnPath(route, idx, { lat: nextStreet.lat, lng: nextStreet.lng });
-          const remainingPipeM = Array.isArray(pt.pipePlan) ? routeDistanceMeters(pt.pipePlan) : 0;
           const pipeBaseV = toNum(pt.pipe?.speedMps) || (toNum(pt.contact?.pipeVelocityMps) || PIPE_SPEED_MIN_MPS);
           const streetEta = baseV > 0 ? remainingStreetM / baseV : null;
-          const pipeEta = pipeBaseV > 0 ? remainingPipeM / pipeBaseV : null;
+          const pipeEta = Array.isArray(pt.pipePlan) && pt.pipePlan.length > 0
+            ? remainingTimeOnPath(pt.pipePlan, 0, pt.pipePlan[0], pipeData.byObjectId, pipeBaseV)
+            : null;
           const eta = streetEta !== null && pipeEta !== null ? streetEta + pipeEta : streetEta ?? pipeEta;
           return withTelemetry(nextStreet, baseV, simV, eta);
         }
@@ -2956,7 +2977,7 @@ export default function App() {
             };
             if (atEnd) return withTelemetry(nextPipe, 0, 0, 0);
             const simV = speed * speedMult;
-            const eta = speed > 0 ? remainingDistanceOnPath(plan, nextIdx, { lat: nextPipe.lat, lng: nextPipe.lng }) / speed : null;
+            const eta = remainingTimeOnPath(plan, nextIdx, { lat: nextPipe.lat, lng: nextPipe.lng }, pipeData.byObjectId, speed);
             return withTelemetry(nextPipe, speed, simV, eta);
           }
 
@@ -2969,7 +2990,7 @@ export default function App() {
             pipe: { ...pt.pipe, speedMps: speed }
           };
           const simV = speed * speedMult;
-          const eta = speed > 0 ? remainingDistanceOnPath(plan, idx, { lat: movingPipe.lat, lng: movingPipe.lng }) / speed : null;
+          const eta = remainingTimeOnPath(plan, idx, { lat: movingPipe.lat, lng: movingPipe.lng }, pipeData.byObjectId, speed);
           return withTelemetry(movingPipe, speed, simV, eta);
         }
 
